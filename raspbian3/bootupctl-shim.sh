@@ -1,37 +1,36 @@
 #!/bin/bash
-# bootupctl shim for bootc on the Raspberry Pi CM4 -- Debian port of the Fedora
-# trick in raspbian3/files/bootupctl-shim.sh.
+# bootupctl shim for bootc on the Raspberry Pi CM4 -- split model (Debian port of
+# the Fedora trick in raspbian3/files/bootupctl-shim.sh).
 #
-# bootc treats "a `bootupctl` executable + /usr/lib/bootupd/updates both exist"
-# as bootupd being available, and then runs (chrooted into the deployment, with
-# the ESP at /boot/efi):
-#   bootupctl backend install --write-uuid [--update-firmware --auto] --filesystem / /
-# first probing `bootupctl backend install --help` for --filesystem support.
-#
-# Debian has no real bootupd, so this standalone shim hijacks that call to stage
-# the full ESP payload (Pi firmware + u-boot.bin + systemd-boot at
-# EFI/BOOT/BOOTAA64.EFI). ostree writes the BLS boot entries separately, and
-# systemd-boot reads them -- so nothing else is needed here.
+# bootc calls `bootupctl backend install [--write-uuid --update-firmware --auto]
+# --filesystem / /` (chrooted into the deployment, ESP at /boot/efi), first
+# probing `... --help` for --filesystem support. This shim:
+#   1. stages the Pi-specific firmware (config.txt, u-boot.bin, start4.elf, ...)
+#      onto the ESP -- bootupd knows nothing about these, and
+#   2. hands the GRUB EFI install to the REAL cross-built bootupd, but only the
+#      EFI component and WITHOUT --update-firmware/--write-uuid, so bootupd never
+#      needs a shim/vendordir (which the Pi doesn't have). bootupd then owns the
+#      GRUB EFI + grub.cfg on the ESP and can update them transactionally.
 set -euo pipefail
 
 if [[ "${1:-}" == "backend" && "${2:-}" == "install" ]]; then
-    # Capability probe: advertise --filesystem so bootc uses the chroot path
-    # (target root "/"), then does nothing else.
+    # Capability probe: advertise --filesystem (bootc then calls with target "/").
     if [[ "$*" == *"--help"* ]]; then
         echo "--filesystem"
         exit 0
     fi
 
-    dest="${@: -1}"   # last arg = target root (usually "/" inside the chroot)
-    esp="${dest%/}/boot/efi"
+    root="${@: -1}"            # target root (usually "/" inside the chroot)
+    esp="${root%/}/boot/efi"
+
     echo "raspbian3: staging Raspberry Pi firmware into ${esp}/" >&2
     mkdir -p "${esp}"
     cp -av /usr/lib/bootc-raspi-firmwares/. "${esp}/"
-    # Marker so the ESP grub.cfg can `search --file` for the ext4 /boot partition
-    # (our substitute for bootupd's UUID stamp / --write-uuid).
-    : > "${dest%/}/boot/bootc-boot-partition" || true
-    echo "raspbian3: firmware staging complete" >&2
+    # Marker so the GRUB config can `search --file` for the ext4 /boot partition.
+    : > "${root%/}/boot/bootc-boot-partition" || true
+
+    echo "raspbian3: installing GRUB EFI via bootupd (EFI component only)" >&2
+    exec /usr/libexec/bootupd install --component EFI --filesystem "${root}" "${root}"
 fi
 
-# No real bootupd on Debian -- nothing further to exec.
 exit 0

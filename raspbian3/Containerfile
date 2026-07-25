@@ -1,6 +1,5 @@
-# raspbian3: U-Boot (UEFI) + GRUB(+blscfg) for the CM4, layered on the
-# cross-built raspian2 image. Uses the Fedora "bootupctl shim" trick to stage the
-# ESP contents at `bootc install` time. See raspbian3/files/ for the Fedora original.
+# raspbian3: U-Boot (UEFI) + GRUB(+blscfg), installed/updated by cross-built
+# bootupd, for the CM4 -- layered on the cross-built raspian2 image.
 #
 # Boot chain on the CM4:
 #   BCM2711 EEPROM -> (ESP/FAT) config.txt + start4.elf -> u-boot.bin
@@ -8,17 +7,18 @@
 #   -> ESP/EFI/BOOT/grub.cfg -> blscfg -> ostree BLS entries on ext4 /boot
 #   -> kernel + initramfs
 #
-# GRUB (not systemd-boot) because /boot is ext4: EFI firmware only reads FAT, so
-# systemd-boot can't read the kernels/entries there -- GRUB ships its own ext4
-# driver. blscfg (reads ostree's /boot/loader/entries) is a Fedora patch absent
-# from upstream/Debian GRUB, so GRUB is cross-built from Fedora's source.
+# Install split (Fedora "bootupctl shim" model): at `bootc install` the shim
+# stages the Pi firmware onto the ESP, then execs the real cross-built bootupd,
+# which installs+owns the GRUB EFI (EFI component only -> no shim/vendordir
+# needed) and can update it transactionally on later `bootupctl update`.
 #
-# The arm64 GRUB EFI is built SEPARATELY (slow gnulib bootstrap; flaky to re-run
-# every build) via raspbian3/grub-cross.Containerfile into image
-# localhost/raspbian3-grub, and pulled in below:
-#   podman build --platform=linux/arm64 -f raspbian3/grub-cross.Containerfile -t raspbian3-grub .
+# GRUB (not systemd-boot) because /boot is ext4 (EFI firmware reads only FAT).
+# blscfg is a Fedora patch absent from upstream/Debian GRUB, and bootupd is not
+# packaged for Debian, so both are cross-built from source into separate images:
+#   podman build --platform=linux/arm64 -f raspbian3/grub-cross.Containerfile    -t raspbian3-grub .
+#   podman build --platform=linux/arm64 -f raspbian3/bootupd-cross.Containerfile -t raspbian3-bootupd .
 
-# ---- Stage 1: assemble the ESP contents ----
+# ---- Stage 1: assemble the Pi firmware set (NOT the EFI bootloader) ----
 FROM --platform=linux/arm64 docker.io/library/debian:trixie AS fw
 RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources && \
     apt-get update -qq && \
@@ -26,43 +26,35 @@ RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sour
     apt-get download raspi-firmware && dpkg-deb -x raspi-firmware_*.deb /rf && \
     rm -rf /var/lib/apt/lists/*
 COPY raspbian3/config.txt /config.txt
-COPY raspbian3/grub.cfg /grub.cfg
-COPY --from=localhost/raspbian3-grub:latest /BOOTAA64.EFI /BOOTAA64.EFI
-RUN mkdir -p /fw/EFI/BOOT /fw/overlays && \
+RUN mkdir -p /fw/overlays && \
     cp /config.txt                             /fw/config.txt && \
     cp /usr/lib/u-boot/rpi_arm64/u-boot.bin    /fw/u-boot.bin && \
     cp /rf/usr/lib/raspi-firmware/start4.elf   /fw/start4.elf && \
     cp /rf/usr/lib/raspi-firmware/fixup4.dat   /fw/fixup4.dat && \
-    cp -a /rf/usr/lib/raspi-firmware/overlays/. /fw/overlays/ && \
-    cp /BOOTAA64.EFI                           /fw/EFI/BOOT/BOOTAA64.EFI && \
-    cp /grub.cfg                               /fw/EFI/BOOT/grub.cfg
+    cp -a /rf/usr/lib/raspi-firmware/overlays/. /fw/overlays/
 
 # ---- Stage 2: layer onto the cross-built CM4 image ----
 FROM localhost/raspian2-bootc:latest
 
-# Stash the full ESP payload (Pi firmware + U-Boot + GRUB). The bootupctl shim
-# copies this onto the ESP during `bootc install`.
+# Pi firmware stash -> the shim copies this onto the ESP at install time.
 COPY --from=fw /fw /usr/lib/bootc-raspi-firmwares/
-COPY raspbian3/bootupctl-shim.sh /usr/bin/bootupctl
 
-# Real cross-built bootupd (transactional ESP bootloader updates). It composes
-# with the shim per the Fedora model: shim stages the Pi firmware, then execs the
-# real bootupctl (at /usr/bin/bootupctl-orig). The install-time shim currently
-# stages GRUB itself; fully handing GRUB install/update to bootupd needs
-# `generate-update-metadata` + Debian vendordir tuning -- validate on hardware.
-COPY --from=localhost/raspbian3-bootupd:latest /bootupd-out/usr/libexec/bootupd        /usr/libexec/bootupd
-COPY --from=localhost/raspbian3-bootupd:latest /bootupd-out/usr/bin/bootupctl          /usr/bin/bootupctl-orig/bootupctl
-COPY --from=localhost/raspbian3-bootupd:latest /bootupd-out/usr/lib/bootupd/grub2-static /usr/lib/bootupd/grub2-static
+# GRUB EFI payload in bootupd's expected layout: usr/lib/efi/<name>/<version>/EFI
+# (bootupd's EFI component installs this to the ESP and tracks it for updates).
+COPY --from=localhost/raspbian3-grub:latest /BOOTAA64.EFI /usr/lib/efi/grub2/1/EFI/BOOT/BOOTAA64.EFI
+COPY raspbian3/grub.cfg                     /usr/lib/efi/grub2/1/EFI/BOOT/grub.cfg
+
+# bootupctl shim (active) + the real cross-built bootupd it execs.
+COPY raspbian3/bootupctl-shim.sh /usr/bin/bootupctl
+COPY --from=localhost/raspbian3-bootupd:latest /bootupd-out/usr/libexec/bootupd /usr/libexec/bootupd
 
 RUN set -eux; \
-    # CM4 device tree(s) from the base kernel -> onto the ESP firmware set.
+    # CM4 device tree(s) from the base kernel -> onto the Pi firmware set.
     cp /usr/lib/linux-image-*/broadcom/bcm2711-rpi-cm4*.dtb /usr/lib/bootc-raspi-firmwares/; \
-    chmod +x /usr/bin/bootupctl /usr/bin/bootupctl-orig/bootupctl; \
-    # Stage the GRUB EFI payload where bootupd reads it (source for its updates).
-    mkdir -p /usr/lib/efi/EFI/BOOT; \
-    cp /usr/lib/bootc-raspi-firmwares/EFI/BOOT/BOOTAA64.EFI /usr/lib/efi/EFI/BOOT/; \
-    cp /usr/lib/bootc-raspi-firmwares/EFI/BOOT/grub.cfg     /usr/lib/efi/EFI/BOOT/; \
-    # bootc only calls bootupctl if /usr/lib/bootupd/updates also exists.
-    mkdir -p /usr/lib/bootupd/updates
+    chmod +x /usr/bin/bootupctl /usr/libexec/bootupd; \
+    # Build bootupd's update manifest (/usr/lib/bootupd/updates/EFI.json) from the
+    # staged EFI payload -- required for `backend install` and `bootupctl update`.
+    mkdir -p /usr/lib/bootupd/updates; \
+    /usr/libexec/bootupd generate-update-metadata /
 
 LABEL containers.bootc 1
