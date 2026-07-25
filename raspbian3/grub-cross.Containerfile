@@ -1,7 +1,11 @@
-# Standalone iteration target: cross-build Fedora's patched GRUB (has blscfg,
-# which upstream GRUB and Debian do NOT ship) for arm64-efi, on the native host.
-# Produces the arm64-efi modules incl. blscfg.mod + a self-contained BOOTAA64.EFI.
-#   podman build --platform=linux/arm64 --target grub -f raspbian3/grub-cross.Containerfile -t grub-cross-test .
+# Cross-build Fedora's patched GRUB (has blscfg, which upstream GRUB and Debian
+# do NOT ship) for arm64-efi, on the native host. Produces the arm64-efi modules
+# incl. blscfg.mod + a self-contained BOOTAA64.EFI at /BOOTAA64.EFI.
+#
+# Built separately from raspbian3 (the gnulib bootstrap is slow/flaky to re-run
+# every image build); raspbian3/Containerfile pulls the result via
+# `COPY --from=localhost/raspbian3-grub`. Build it with:
+#   podman build --platform=linux/arm64 -f raspbian3/grub-cross.Containerfile -t raspbian3-grub .
 FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS grub
 
 RUN apt-get update -qq && apt-get install -y --no-install-recommends \

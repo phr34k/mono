@@ -27,6 +27,9 @@ if [[ "${1:-}" == "backend" && "${2:-}" == "install" ]]; then
     echo "raspbian3: staging Raspberry Pi firmware into ${esp}/" >&2
     mkdir -p "${esp}"
     cp -av /usr/lib/bootc-raspi-firmwares/. "${esp}/"
+    # Marker so the ESP grub.cfg can `search --file` for the ext4 /boot partition
+    # (our substitute for bootupd's UUID stamp / --write-uuid).
+    : > "${dest%/}/boot/bootc-boot-partition" || true
     echo "raspbian3: firmware staging complete" >&2
 fi
 

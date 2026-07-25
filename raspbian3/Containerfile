@@ -1,45 +1,47 @@
-# raspbian3: U-Boot (as a UEFI provider) + systemd-boot for the CM4, layered on
-# the cross-built raspian2 image. Uses the Fedora "bootupctl shim" trick to stage
-# the ESP contents at `bootc install` time. See raspbian3/files/ for the Fedora
-# original this is ported from.
+# raspbian3: U-Boot (UEFI) + GRUB(+blscfg) for the CM4, layered on the
+# cross-built raspian2 image. Uses the Fedora "bootupctl shim" trick to stage the
+# ESP contents at `bootc install` time. See raspbian3/files/ for the Fedora original.
 #
 # Boot chain on the CM4:
 #   BCM2711 EEPROM -> (ESP/FAT) config.txt + start4.elf -> u-boot.bin
-#   -> U-Boot `bootflow scan` -> ESP/EFI/BOOT/BOOTAA64.EFI (systemd-boot)
-#   -> ostree BLS entries (/boot/loader/entries/*.conf) -> kernel + initramfs
+#   -> U-Boot `bootflow scan` -> ESP/EFI/BOOT/BOOTAA64.EFI (GRUB)
+#   -> ESP/EFI/BOOT/grub.cfg -> blscfg -> ostree BLS entries on ext4 /boot
+#   -> kernel + initramfs
 #
-# systemd-boot is placed at the removable-media fallback path EFI/BOOT/BOOTAA64.EFI
-# so U-Boot's EFI bootmeth runs it with no persistent EFI NVRAM (the Pi keeps
-# none). ostree therefore stays on its DEFAULT (BLS) bootloader backend -- no
-# uEnv.txt / uboot backend to force.
+# GRUB (not systemd-boot) because /boot is ext4: EFI firmware only reads FAT, so
+# systemd-boot can't read the kernels/entries there -- GRUB ships its own ext4
+# driver. blscfg (reads ostree's /boot/loader/entries) is a Fedora patch absent
+# from upstream/Debian GRUB, so GRUB is cross-built from Fedora's source.
 #
-# raspian2 is a finalized bootc image (bootc-rootfs.sh wiped /var incl. the dpkg
-# db), so apt cannot run on top of it; the ESP contents are assembled in a
-# separate Debian stage and COPY'd in.
+# The arm64 GRUB EFI is built SEPARATELY (slow gnulib bootstrap; flaky to re-run
+# every build) via raspbian3/grub-cross.Containerfile into image
+# localhost/raspbian3-grub, and pulled in below:
+#   podman build --platform=linux/arm64 -f raspbian3/grub-cross.Containerfile -t raspbian3-grub .
 
 # ---- Stage 1: assemble the ESP contents ----
 FROM --platform=linux/arm64 docker.io/library/debian:trixie AS fw
 RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources && \
     apt-get update -qq && \
-    apt-get install -y --no-install-recommends u-boot-rpi systemd-boot-efi && \
+    apt-get install -y --no-install-recommends u-boot-rpi && \
     apt-get download raspi-firmware && dpkg-deb -x raspi-firmware_*.deb /rf && \
     rm -rf /var/lib/apt/lists/*
 COPY raspbian3/config.txt /config.txt
-COPY raspbian3/loader.conf /loader.conf
-RUN mkdir -p /fw/EFI/BOOT /fw/loader /fw/overlays && \
-    cp /config.txt                                    /fw/config.txt && \
-    cp /usr/lib/u-boot/rpi_arm64/u-boot.bin           /fw/u-boot.bin && \
-    cp /rf/usr/lib/raspi-firmware/start4.elf          /fw/start4.elf && \
-    cp /rf/usr/lib/raspi-firmware/fixup4.dat          /fw/fixup4.dat && \
-    cp -a /rf/usr/lib/raspi-firmware/overlays/.        /fw/overlays/ && \
-    cp /usr/lib/systemd/boot/efi/systemd-bootaa64.efi /fw/EFI/BOOT/BOOTAA64.EFI && \
-    cp /loader.conf                                   /fw/loader/loader.conf
+COPY raspbian3/grub.cfg /grub.cfg
+COPY --from=localhost/raspbian3-grub:latest /BOOTAA64.EFI /BOOTAA64.EFI
+RUN mkdir -p /fw/EFI/BOOT /fw/overlays && \
+    cp /config.txt                             /fw/config.txt && \
+    cp /usr/lib/u-boot/rpi_arm64/u-boot.bin    /fw/u-boot.bin && \
+    cp /rf/usr/lib/raspi-firmware/start4.elf   /fw/start4.elf && \
+    cp /rf/usr/lib/raspi-firmware/fixup4.dat   /fw/fixup4.dat && \
+    cp -a /rf/usr/lib/raspi-firmware/overlays/. /fw/overlays/ && \
+    cp /BOOTAA64.EFI                           /fw/EFI/BOOT/BOOTAA64.EFI && \
+    cp /grub.cfg                               /fw/EFI/BOOT/grub.cfg
 
 # ---- Stage 2: layer onto the cross-built CM4 image ----
 FROM localhost/raspian2-bootc:latest
 
-# Stash the full ESP payload (Pi firmware + U-Boot + systemd-boot). The bootupctl
-# shim copies this onto the ESP during `bootc install`.
+# Stash the full ESP payload (Pi firmware + U-Boot + GRUB). The bootupctl shim
+# copies this onto the ESP during `bootc install`.
 COPY --from=fw /fw /usr/lib/bootc-raspi-firmwares/
 COPY raspbian3/bootupctl-shim.sh /usr/bin/bootupctl
 
