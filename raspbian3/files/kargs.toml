@@ -1,0 +1,30 @@
+kargs = [
+  "console=tty0",                 # screen = primary console (last entry gets the panic + shell)
+  "plymouth.enable=1",            # <-- stop the splash from hiding userspace/failure messages
+  # NB: do NOT add "plymouth.force-splash" — it is not a real plymouth karg, and its
+  # "-splash" substring breaks plymouth's command_line_has_argument("splash") check
+  # (substring match hits "-splash" first, wrong word boundary) so the graphical
+  # splash is never shown. Plain "splash" below is what actually enables it.
+  "plymouth.ignore-serial-consoles",
+  "logo.nologo",
+  "vt.global_cursor_default=0",
+  "quiet",
+  "splash",
+  "rhgb",                         # Red Hat Graphical Boot: makes systemd hand the console
+                                  # to plymouth and keeps boot text off screen (Fedora's
+                                  # canonical graphical-boot flag; "splash" alone doesn't do this)
+  "loglevel=0",                   # verbose, but NOT the debug flood
+  "udev.log_level=3",             # silence udev coldplug lines during the pre-splash window
+  "rd.udev.log_level=3",
+  "systemd.show_status=false",
+  "rd.systemd.show_status=false",
+  "rd.driver.pre=vc4",
+  # Boot on the CM4 registers the firmware framebuffer as a built-in simpledrm
+  # card *before* vc4-kms binds. Plymouth grabs that transient card, then the
+  # vc4 aperture handoff yanks it away mid-draw ("Could not allocate GEM
+  # object: No such device"), so the splash never renders and the panel stays
+  # black until lightdm. Blacklisting simpledrm's initcall removes that decoy
+  # card; Plymouth waits ~1s and starts cleanly on vc4. (simpledrm is built-in,
+  # so modprobe.blacklist can't touch it — this is the only lever.)
+  "initcall_blacklist=simpledrm_platform_driver_init"
+]

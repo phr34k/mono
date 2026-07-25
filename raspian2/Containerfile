@@ -1,0 +1,121 @@
+# Target: Raspberry Pi Compute Module 4 (aarch64), Debian trixie base.
+#
+# Same from-source chain as raspbian/ (libcomposefs -> ostree 2025.7 -> bootc),
+# but CROSS-COMPILED: the builder stage runs on the NATIVE build host
+# (--platform=$BUILDPLATFORM) and emits aarch64 binaries via a cross toolchain,
+# so the heavy C/Rust compilation is NOT emulated. Only the final runtime stage
+# runs as the arm64 target (light apt/dracut work).
+#
+# Build with (BuildKit sets BUILDPLATFORM=host, TARGETPLATFORM=arm64):
+#   podman build --platform=linux/arm64 -f raspian2/Containerfile -t raspian2-bootc:latest .
+FROM scratch AS ctx
+
+COPY ../shared/ /shared
+# Copy only the files the builder needs (not the whole dir/Containerfile), so
+# edits to this Containerfile's runtime stage don't invalidate the cached
+# cross-compile in the builder stage.
+COPY ../raspian2/aarch64-cross.txt ../raspian2/install-bootc.sh /raspian2/
+
+# ---- Cross builder: runs natively on the build host, targets aarch64 ----
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS builder
+
+# Enable arm64 multiarch + deb-src, then pull the aarch64 cross toolchain, the
+# native build tools, and aarch64 dev libraries (ostree's full build-dep set
+# for the arm64 host, plus composefs/bootc extras).
+RUN dpkg --add-architecture arm64 && \
+    sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources && \
+    apt update -y && \
+    apt install -y crossbuild-essential-arm64 git curl ca-certificates make pkgconf \
+                   meson ninja-build python3 autoconf automake libtool gtk-doc-tools bison \
+                   libglib2.0-dev:arm64 libgpgme-dev:arm64 libcurl4-openssl-dev:arm64 \
+                   libarchive-dev:arm64 libmount-dev:arm64 libselinux1-dev:arm64 \
+                   liblzma-dev:arm64 zlib1g-dev:arm64 libcap-dev:arm64 libsystemd-dev:arm64 \
+                   libfuse3-dev:arm64 libssl-dev:arm64 libzstd-dev:arm64
+
+# Cross pkg-config: resolve aarch64 .pc files, allow cross for Rust system-deps.
+ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+ENV PKG_CONFIG_SYSROOT_DIR=/
+ENV PKG_CONFIG_ALLOW_CROSS=1
+
+# --- libcomposefs (cross) ---
+WORKDIR /src/composefs
+RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
+    git clone --depth 1 -b v1.0.8 https://github.com/composefs/composefs.git . && \
+    meson setup build --cross-file /ctx/raspian2/aarch64-cross.txt \
+          --prefix=/usr --libdir=lib/aarch64-linux-gnu -Dman=disabled && \
+    meson compile -C build && \
+    DESTDIR=/output meson install -C build && \
+    cp -a /output/usr/. /usr/
+
+# --- ostree 2025.7 with composefs (cross) ---
+WORKDIR /src/ostree
+RUN git clone --depth 1 -b v2025.7 --recurse-submodules https://github.com/ostreedev/ostree.git . && \
+    NOCONFIGURE=1 ./autogen.sh && \
+    ./configure --host=aarch64-linux-gnu --build="$(dpkg-architecture -qDEB_BUILD_GNU_TYPE)" \
+                --prefix=/usr --libdir=/usr/lib/aarch64-linux-gnu \
+                --with-composefs --with-curl --without-soup \
+                --disable-introspection --disable-gtk-doc --disable-man && \
+    make -j"$(nproc)" && \
+    make install DESTDIR=/output && \
+    cp -a /output/usr/. /usr/
+
+# --- bootc (cross via cargo) ---
+ENV CARGO_HOME=/tmp/rust
+ENV RUSTUP_HOME=/tmp/rust
+ENV CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
+WORKDIR /home/build
+RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
+    git clone --depth 1 https://github.com/bootc-dev/bootc.git . && \
+    curl --proto '=https' --tlsv1.2 -sSf "https://sh.rustup.rs" | \
+        sh -s -- --profile minimal -y --default-host "$(dpkg-architecture -qDEB_BUILD_GNU_TYPE | sed 's/-linux-/-unknown-linux-/')" && \
+    . "${RUSTUP_HOME}/env" && \
+    rustup target add aarch64-unknown-linux-gnu && \
+    cargo build --release --bins && \
+    bash /ctx/raspian2/install-bootc.sh
+
+# ---- Runtime: the aarch64 target image ----
+# Pin to the arm64 target explicitly: the builder pulled debian:trixie as the
+# native build arch, and without this podman would reuse that wrong-arch image
+# here (making apt look at the amd64 index -> no linux-image-arm64).
+FROM --platform=linux/arm64 docker.io/library/debian:trixie AS system
+
+RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources
+
+RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root --mount=type=tmpfs,dst=/boot apt update -y && \
+  apt install -y btrfs-progs bubblewrap dosfstools dracut e2fsprogs fdisk firmware-linux-free firmware-brcm80211 \
+    fuse3 libssl3 libcurl4t64 libostree-1-1 linux-image-arm64 raspi-firmware netplan.io libnss-resolve libnss-myhostname \
+    openssh-server skopeo systemd systemd-resolved xfsprogs && \
+  cp /boot/vmlinuz-* "$(find /usr/lib/modules -maxdepth 1 -type d | tail -n 1)/vmlinuz" && \
+  apt clean -y
+
+# Overlay cross-built bootc + ostree 2025.7 + libcomposefs, refresh linker cache.
+COPY --from=builder /output /
+RUN ldconfig
+
+RUN systemctl enable systemd-networkd systemd-resolved ssh && \
+    printf 'L! /etc/resolv.conf - - - - /run/systemd/resolve/stub-resolv.conf\n' \
+        > /usr/lib/tmpfiles.d/resolv-conf.conf && \
+    mkdir -p /etc/netplan && \
+    printf 'network:\n  version: 2\n  ethernets:\n    all-en:\n      match:\n        name: en*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n    all-eth:\n      match:\n        name: eth*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n' > /etc/netplan/90-default.yaml && \
+    sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config || true
+
+RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root \
+    --mount=type=bind,from=ctx,source=/,target=/ctx \
+    /ctx/shared/initramfs.sh
+
+RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
+    sed -i 's|^HOME=.*|HOME=/var/home|' "/etc/default/useradd" && \
+    /ctx/shared/bootc-rootfs.sh
+
+LABEL containers.bootc 1
+
+# `bootc container lint` executes the target-arch binary. In a cross-build the
+# only way to run it on a non-arm64 host is qemu-user, which returns ENOSYS
+# (os error 38) for some syscalls bootc uses -- an emulation limitation, not an
+# image defect. Keep it non-fatal here; run `bootc container lint` for real on
+# native arm64 (hardware or an arm64 CI runner).
+RUN bootc container lint || \
+    echo "WARNING: 'bootc container lint' did not run to completion (qemu-user emulation limitation); run it on native arm64"

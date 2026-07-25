@@ -1,0 +1,53 @@
+# raspbian3: U-Boot (as a UEFI provider) + systemd-boot for the CM4, layered on
+# the cross-built raspian2 image. Uses the Fedora "bootupctl shim" trick to stage
+# the ESP contents at `bootc install` time. See raspbian3/files/ for the Fedora
+# original this is ported from.
+#
+# Boot chain on the CM4:
+#   BCM2711 EEPROM -> (ESP/FAT) config.txt + start4.elf -> u-boot.bin
+#   -> U-Boot `bootflow scan` -> ESP/EFI/BOOT/BOOTAA64.EFI (systemd-boot)
+#   -> ostree BLS entries (/boot/loader/entries/*.conf) -> kernel + initramfs
+#
+# systemd-boot is placed at the removable-media fallback path EFI/BOOT/BOOTAA64.EFI
+# so U-Boot's EFI bootmeth runs it with no persistent EFI NVRAM (the Pi keeps
+# none). ostree therefore stays on its DEFAULT (BLS) bootloader backend -- no
+# uEnv.txt / uboot backend to force.
+#
+# raspian2 is a finalized bootc image (bootc-rootfs.sh wiped /var incl. the dpkg
+# db), so apt cannot run on top of it; the ESP contents are assembled in a
+# separate Debian stage and COPY'd in.
+
+# ---- Stage 1: assemble the ESP contents ----
+FROM --platform=linux/arm64 docker.io/library/debian:trixie AS fw
+RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends u-boot-rpi systemd-boot-efi && \
+    apt-get download raspi-firmware && dpkg-deb -x raspi-firmware_*.deb /rf && \
+    rm -rf /var/lib/apt/lists/*
+COPY raspbian3/config.txt /config.txt
+COPY raspbian3/loader.conf /loader.conf
+RUN mkdir -p /fw/EFI/BOOT /fw/loader /fw/overlays && \
+    cp /config.txt                                    /fw/config.txt && \
+    cp /usr/lib/u-boot/rpi_arm64/u-boot.bin           /fw/u-boot.bin && \
+    cp /rf/usr/lib/raspi-firmware/start4.elf          /fw/start4.elf && \
+    cp /rf/usr/lib/raspi-firmware/fixup4.dat          /fw/fixup4.dat && \
+    cp -a /rf/usr/lib/raspi-firmware/overlays/.        /fw/overlays/ && \
+    cp /usr/lib/systemd/boot/efi/systemd-bootaa64.efi /fw/EFI/BOOT/BOOTAA64.EFI && \
+    cp /loader.conf                                   /fw/loader/loader.conf
+
+# ---- Stage 2: layer onto the cross-built CM4 image ----
+FROM localhost/raspian2-bootc:latest
+
+# Stash the full ESP payload (Pi firmware + U-Boot + systemd-boot). The bootupctl
+# shim copies this onto the ESP during `bootc install`.
+COPY --from=fw /fw /usr/lib/bootc-raspi-firmwares/
+COPY raspbian3/bootupctl-shim.sh /usr/bin/bootupctl
+
+RUN set -eux; \
+    # CM4 device tree(s) from the base kernel -> onto the ESP firmware set.
+    cp /usr/lib/linux-image-*/broadcom/bcm2711-rpi-cm4*.dtb /usr/lib/bootc-raspi-firmwares/; \
+    chmod +x /usr/bin/bootupctl; \
+    # bootc only calls bootupctl if /usr/lib/bootupd/updates also exists.
+    mkdir -p /usr/lib/bootupd/updates
+
+LABEL containers.bootc 1

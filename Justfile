@@ -15,7 +15,17 @@ test IMAGE=image_name:
     just bcvk build-and-test {{IMAGE}}
 
 build $image_name=image_name:
-    {{sudo_prefix}}{{container_runtime}} build -f {{image_name}}/Containerfile -t "${image_name}-bootc:latest" .
+    #!/usr/bin/env bash
+    set -euo pipefail
+    # raspbian/raspian2 target the Raspberry Pi CM4 (aarch64), so default them to
+    # an arm64 build. Override for any image with BUILD_PLATFORM=linux/amd64 etc.
+    # (raspian2 cross-compiles: its builder stage pins to $BUILDPLATFORM and runs
+    # natively, so --platform only sets the arm64 *target*.)
+    platform="${BUILD_PLATFORM:-}"
+    case "$image_name" in raspbian|raspian2|raspbian3) [ -z "$platform" ] && platform="linux/arm64" ;; esac
+    args=()
+    [ -n "$platform" ] && args+=(--platform "$platform")
+    {{sudo_prefix}}{{container_runtime}} build "${args[@]}" -f "$image_name/Containerfile" -t "${image_name}-bootc:latest" .
 
 bootc $image_name=image_name $image_tag=image_tag *ARGS:
     sudo {{container_runtime}} run \

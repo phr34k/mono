@@ -1,0 +1,13 @@
+# Raspberry Pi Compute Module 4 -- chainload U-Boot.
+#
+# The BCM2711 boot ROM + EEPROM firmware read this file from the FAT firmware
+# partition and load u-boot.bin as the "kernel". U-Boot then runs boot.scr,
+# which imports ostree's /loader/uEnv.txt and boots the bootc/ostree deployment.
+arm_64bit=1
+enable_uart=1
+kernel=u-boot.bin
+
+[cm4]
+otg_mode=1
+
+[all]
