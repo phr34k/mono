@@ -7,10 +7,10 @@
 # probing `... --help` for --filesystem support. This shim:
 #   1. stages the Pi-specific firmware (config.txt, u-boot.bin, start4.elf, ...)
 #      onto the ESP -- bootupd knows nothing about these, and
-#   2. hands the GRUB EFI install to the REAL cross-built bootupd, but only the
-#      EFI component and WITHOUT --update-firmware/--write-uuid, so bootupd never
-#      needs a shim/vendordir (which the Pi doesn't have). bootupd then owns the
-#      GRUB EFI + grub.cfg on the ESP and can update them transactionally.
+#   2. hands the EFI install (shim + GRUB) to the REAL cross-built bootupd, but
+#      only the EFI component (no --update-firmware, so no efibootmgr). The image
+#      ships a Debian shimaa64.efi so bootupd's vendordir detection succeeds.
+#      bootupd then owns the shim+GRUB on the ESP and can update it transactionally.
 set -euo pipefail
 
 if [[ "${1:-}" == "backend" && "${2:-}" == "install" ]]; then

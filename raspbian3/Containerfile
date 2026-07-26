@@ -3,14 +3,15 @@
 #
 # Boot chain on the CM4:
 #   BCM2711 EEPROM -> (ESP/FAT) config.txt + start4.elf -> u-boot.bin
-#   -> U-Boot `bootflow scan` -> ESP/EFI/BOOT/BOOTAA64.EFI (GRUB)
-#   -> ESP/EFI/BOOT/grub.cfg -> blscfg -> ostree BLS entries on ext4 /boot
+#   -> U-Boot `bootflow scan` -> ESP/EFI/BOOT/BOOTAA64.EFI (shim)
+#   -> shim -> grubaa64.efi -> grub.cfg -> blscfg -> ostree BLS on ext4 /boot
 #   -> kernel + initramfs
 #
-# Install split (Fedora "bootupctl shim" model): at `bootc install` the shim
-# stages the Pi firmware onto the ESP, then execs the real cross-built bootupd,
-# which installs+owns the GRUB EFI (EFI component only -> no shim/vendordir
-# needed) and can update it transactionally on later `bootupctl update`.
+# Install (Fedora "bootupctl shim" model): at `bootc install` the shim stages the
+# Pi firmware onto the ESP, then execs the real cross-built bootupd to install the
+# EFI component (shim + GRUB). bootupd needs a shimaa64.efi for vendordir
+# detection -- hence the Debian shim in the payload -- and can then update the
+# bootloader transactionally on later `bootupctl update`.
 #
 # GRUB (not systemd-boot) because /boot is ext4 (EFI firmware reads only FAT).
 # blscfg is a Fedora patch absent from upstream/Debian GRUB, and bootupd is not
@@ -23,7 +24,9 @@ FROM --platform=linux/arm64 docker.io/library/debian:trixie AS fw
 RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources && \
     apt-get update -qq && \
     apt-get install -y --no-install-recommends u-boot-rpi && \
-    apt-get download raspi-firmware && dpkg-deb -x raspi-firmware_*.deb /rf && \
+    apt-get download raspi-firmware shim-unsigned && \
+    dpkg-deb -x raspi-firmware_*.deb /rf && \
+    dpkg-deb -x shim-unsigned_*.deb /shimpkg && \
     rm -rf /var/lib/apt/lists/*
 COPY raspbian3/config.txt /config.txt
 RUN mkdir -p /fw/overlays && \
@@ -39,10 +42,16 @@ FROM localhost/raspian2-bootc:latest
 # Pi firmware stash -> the shim copies this onto the ESP at install time.
 COPY --from=fw /fw /usr/lib/bootc-raspi-firmwares/
 
-# GRUB EFI payload in bootupd's expected layout: usr/lib/efi/<name>/<version>/EFI
-# (bootupd's EFI component installs this to the ESP and tracks it for updates).
-COPY --from=localhost/raspbian3-grub:latest /BOOTAA64.EFI /usr/lib/efi/grub2/1/EFI/BOOT/BOOTAA64.EFI
-COPY raspbian3/grub.cfg                     /usr/lib/efi/grub2/1/EFI/BOOT/grub.cfg
+# EFI payload in bootupd's expected layout (usr/lib/efi/<name>/<version>/EFI),
+# Fedora-style shim + GRUB so bootupd's vendordir detection (which needs a
+# shimaa64.efi) succeeds. On the Pi, U-Boot boots EFI/BOOT/BOOTAA64.EFI (shim),
+# which chainloads grubaa64.efi from the same dir; GRUB (prefix /EFI/BOOT) then
+# reads grub.cfg. Everything lives in EFI/BOOT so no persistent EFI NVRAM is
+# needed (the Pi keeps none).
+COPY --from=localhost/raspbian3-grub:latest /BOOTAA64.EFI          /usr/lib/efi/grub2/1/EFI/BOOT/grubaa64.efi
+COPY --from=fw /shimpkg/usr/lib/shim/shimaa64.efi                  /usr/lib/efi/grub2/1/EFI/BOOT/shimaa64.efi
+COPY --from=fw /shimpkg/usr/lib/shim/shimaa64.efi                  /usr/lib/efi/grub2/1/EFI/BOOT/BOOTAA64.EFI
+COPY raspbian3/grub.cfg                                            /usr/lib/efi/grub2/1/EFI/BOOT/grub.cfg
 
 # bootupctl shim (active) + the real cross-built bootupd it execs.
 COPY raspbian3/bootupctl-shim.sh /usr/bin/bootupctl
@@ -52,6 +61,10 @@ RUN set -eux; \
     # CM4 device tree(s) from the base kernel -> onto the Pi firmware set.
     cp /usr/lib/linux-image-*/broadcom/bcm2711-rpi-cm4*.dtb /usr/lib/bootc-raspi-firmwares/; \
     chmod +x /usr/bin/bootupctl /usr/libexec/bootupd; \
+    # Debian defaults CREATE_HOME=no; Fedora=yes. image-builder's users stage
+    # relies on that default when the blueprint user has no explicit home, so
+    # match Fedora so `useradd` creates /var/home/<user> (+ .ssh) at build.
+    echo 'CREATE_HOME yes' >> /etc/login.defs; \
     # Build bootupd's update manifest (/usr/lib/bootupd/updates/EFI.json) from the
     # staged EFI payload -- required for `backend install` and `bootupctl update`.
     mkdir -p /usr/lib/bootupd/updates; \
