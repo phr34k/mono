@@ -1,36 +1,33 @@
 #!/bin/bash
-# bootupctl shim for bootc on the Raspberry Pi CM4 -- split model (Debian port of
-# the Fedora trick in raspbian3/files/bootupctl-shim.sh).
+# bootupctl shim for bootc on the Raspberry Pi CM4 -- matches supakeen's/Ondrej
+# Budai's Fedora approach: https://supakeen.com/weblog/bootc-on-the-raspberry-pi/
 #
-# bootc calls `bootupctl backend install [--write-uuid --update-firmware --auto]
-# --filesystem / /` (chrooted into the deployment, ESP at /boot/efi), first
-# probing `... --help` for --filesystem support. This shim:
-#   1. stages the Pi-specific firmware (config.txt, u-boot.bin, start4.elf, ...)
-#      onto the ESP -- bootupd knows nothing about these, and
-#   2. hands the EFI install (shim + GRUB) to the REAL cross-built bootupd, but
-#      only the EFI component (no --update-firmware, so no efibootmgr). The image
-#      ships a Debian shimaa64.efi so bootupd's vendordir detection succeeds.
-#      bootupd then owns the shim+GRUB on the ESP and can update it transactionally.
+# bootc calls `bootupctl backend install <flags> <root>` (chrooted into the
+# deployment, ESP at /boot/efi). We copy the Pi firmware (dtbs, start*.elf,
+# fixup*.dat, config.txt, u-boot.bin, overlays) onto the ESP root, then exec the
+# REAL bootupctl UNCHANGED. bootupd's `backend install` is additive -- it manages
+# files under EFI/ and does NOT wipe the firmware at the ESP root -- so the Pi
+# firmware and the EFI bootloader (shim + GRUB) coexist.
+# (Workaround pending https://github.com/coreos/bootupd/issues/766.)
 set -euo pipefail
 
 if [[ "${1:-}" == "backend" && "${2:-}" == "install" ]]; then
-    # Capability probe: advertise --filesystem (bootc then calls with target "/").
+    # Capability probe: advertise --filesystem (the real bootupctl supports it).
     if [[ "$*" == *"--help"* ]]; then
         echo "--filesystem"
         exit 0
     fi
 
-    root="${@: -1}"            # target root (usually "/" inside the chroot)
-    esp="${root%/}/boot/efi"
-
-    echo "raspbian3: staging Raspberry Pi firmware into ${esp}/" >&2
-    mkdir -p "${esp}"
-    cp -av /usr/lib/bootc-raspi-firmwares/. "${esp}/"
+    root="${@: -1}"            # target root (last arg, usually "/" in the chroot)
+    echo "raspbian3: copying Raspberry Pi firmware into ${root%/}/boot/efi/" >&2
+    cp -av /usr/lib/bootc-raspi-firmwares/. "${root%/}/boot/efi/"
     # Marker so the GRUB config can `search --file` for the ext4 /boot partition.
     : > "${root%/}/boot/bootc-boot-partition" || true
-
-    echo "raspbian3: installing GRUB EFI via bootupd (EFI component only)" >&2
-    exec /usr/libexec/bootupd install --component EFI --filesystem "${root}" "${root}"
+    # CRITICAL: flush to disk before bootupd re-mounts the ESP. Otherwise our
+    # writes are still in the mount cache, bootupd's fresh mount doesn't see them,
+    # and the firmware is lost (only bootupd's EFI/ survives).
+    sync
 fi
 
-exit 0
+# Hand off to the real bootupd unchanged -- it installs the EFI bootloader.
+exec /usr/bin/bootupctl-orig/bootupctl "$@"
