@@ -202,21 +202,80 @@ RUN --mount=type=cache,target=/src/target,sharing=locked \
     install -m644 -D -t /bootupd-out/usr/lib/bootupd/grub2-static/configs.d src/grub2/configs.d/*.cfg && \
     file /bootupd-out/usr/bin/bootupctl 2>/dev/null || readelf -h "$T/bootupd" | grep Machine
 
+# ---- uboot: rebuild U-Boot for the CM4 with no boot menu + a preboot BMP splash ----
+# Debian's stock u-boot-rpi has CONFIG_BOOTDELAY=2 and the bootstd auto-menu, so the
+# Pi shows a "Hit any key to stop autoboot" countdown + menu before GRUB, and has no
+# early splash (the panel is black until vc4/plymouth at ~4s -- which is why plymouth
+# "barely showed"). We rebuild rpi_arm64_defconfig with:
+#   CONFIG_BOOTDELAY=0 / CONFIG_AUTOBOOT_MENU_SHOW=n -> no countdown, no U-Boot menu
+#   preboot BMP splash -> paint splash.bmp off the FAT at ~1s and hold it (stdout on
+#     serial only, so no U-Boot text overwrites it) straight through to plymouth on
+#     the same image -> seamless, covering the 0->vc4 black gap.
+# Builds natively on the host arch (--platform=$BUILDPLATFORM); cross-compiles with
+# aarch64-linux-gnu- on x86_64 hosts. Consumed by the fw stage below.
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS uboot
+ARG UBOOT_REF=v2025.07
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        git make gcc bc bison flex libssl-dev libgnutls28-dev device-tree-compiler \
+        python3 python3-setuptools python3-dev swig ca-certificates \
+        crossbuild-essential-arm64
+WORKDIR /src
+RUN git clone --depth 1 --branch "${UBOOT_REF}" https://source.denx.de/u-boot/u-boot.git .
+RUN set -eux; \
+    if [ "$(dpkg --print-architecture)" = "arm64" ]; then CROSS=""; else CROSS="aarch64-linux-gnu-"; fi; \
+    # Blank U-Boot's HDMI text: write only to serial so the panel stays on the
+    # splash. Asserted so an upstream rpi.env rename fails the build loudly rather
+    # than silently leaving text on screen.
+    grep -q '^stdout=serial,vidconsole$' board/raspberrypi/rpi/rpi.env; \
+    grep -q '^stderr=serial,vidconsole$' board/raspberrypi/rpi/rpi.env; \
+    sed -i -e 's/^stdout=serial,vidconsole$/stdout=serial/' \
+           -e 's/^stderr=serial,vidconsole$/stderr=serial/' \
+           board/raspberrypi/rpi/rpi.env; \
+    # Pin boot to eMMC (skip the slow usb/pxe/dhcp scan) and drop usbkbd from stdin.
+    grep -q '^boot_targets=mmc usb pxe dhcp$' board/raspberrypi/rpi/rpi.env; \
+    grep -q '^stdin=serial,usbkbd$' board/raspberrypi/rpi/rpi.env; \
+    sed -i -e 's/^boot_targets=mmc usb pxe dhcp$/boot_targets=mmc/' \
+           -e 's/^stdin=serial,usbkbd$/stdin=serial/' \
+           board/raspberrypi/rpi/rpi.env; \
+    # Early splash: load splash.bmp off the FAT (mmc 0:1, put there by the bootupctl
+    # shim) and center it. `&&` so a missing/failed load never blocks boot. 0x04000000
+    # is free scratch RAM, overwritten later by the kernel load.
+    printf '%s\n' 'preboot=fatload mmc 0:1 0x04000000 splash.bmp && bmp display 0x04000000 m m' \
+        >> board/raspberrypi/rpi/rpi.env; \
+    make rpi_arm64_defconfig; \
+    ./scripts/config --set-val CONFIG_BOOTDELAY 0; \
+    ./scripts/config --disable CONFIG_AUTOBOOT_MENU_SHOW; \
+    ./scripts/config --disable CONFIG_VIDEO_LOGO; \
+    ./scripts/config --enable CONFIG_USE_PREBOOT; \
+    ./scripts/config --enable CONFIG_CMD_BMP; \
+    ./scripts/config --enable CONFIG_BMP_16BPP; \
+    ./scripts/config --enable CONFIG_BMP_24BPP; \
+    ./scripts/config --enable CONFIG_BMP_32BPP; \
+    ./scripts/config --enable CONFIG_SPLASH_SCREEN; \
+    ./scripts/config --enable CONFIG_SPLASH_SCREEN_ALIGN; \
+    make CROSS_COMPILE="$CROSS" olddefconfig; \
+    make CROSS_COMPILE="$CROSS" -j"$(nproc)"; \
+    cp u-boot.bin /rpi-u-boot.bin
+
 # ---- fw: assemble the Pi firmware set (VideoCore + U-Boot + shim) ----
 # Runs as the arm64 target: just extracts .debs, no compilation.
 FROM --platform=linux/arm64 docker.io/library/debian:trixie AS fw
 RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources && \
     apt-get update -qq && \
-    apt-get install -y --no-install-recommends u-boot-rpi && \
     apt-get download raspi-firmware shim-unsigned grub-common && \
     dpkg-deb -x raspi-firmware_*.deb /rf && \
     dpkg-deb -x shim-unsigned_*.deb /shimpkg && \
     dpkg-deb -x grub-common_*.deb /grubcommon && \
     rm -rf /var/lib/apt/lists/*
 COPY raspian2/config.txt /config.txt
+# Custom U-Boot (no boot menu + preboot BMP splash) from the uboot stage, replacing
+# Debian's stock u-boot-rpi (whose countdown/menu we were seeing before GRUB).
+COPY --from=uboot /rpi-u-boot.bin /fw/u-boot.bin
 RUN mkdir -p /fw/overlays && \
     cp /config.txt                             /fw/config.txt && \
-    cp /usr/lib/u-boot/rpi_arm64/u-boot.bin    /fw/u-boot.bin && \
     cp /rf/usr/lib/raspi-firmware/start*.elf   /fw/ && \
     cp /rf/usr/lib/raspi-firmware/fixup*.dat   /fw/ && \
     cp /rf/usr/lib/raspi-firmware/bootcode.bin /fw/ && \
@@ -248,6 +307,13 @@ RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sour
 # rejected by trixie's sqv). Pin the repo to 100 so it supplies ONLY packages that
 # Debian doesn't have (the RPi kernel + its RPi-only deps) and never silently
 # upgrades the Debian userland the cross-built ostree/bootc/composefs links against.
+#
+# Kernel is pinned to the EXACT version linux-image-6.12.75+rpt-rpi-v8 (NOT the
+# rolling linux-image-rpi-v8 meta): (a) so "latest" can't shift under us between
+# builds, and (b) to test whether the RS-485 DE-timing regression is in the newer
+# 6.18 kernel -- 6.12 is the series older pi-gen/RPi-OS images (which had working
+# comms) ran. To change kernels, edit the one version string in the apt line below;
+# the RPi repo also has 6.12.62/47, 6.18.29/33/34, and -rt (PREEMPT_RT) variants.
 COPY raspian2/raspberrypi-archive-keyring.pgp /usr/share/keyrings/raspberrypi-archive-keyring.pgp
 RUN printf 'Types: deb\nURIs: http://archive.raspberrypi.com/debian/\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/raspberrypi-archive-keyring.pgp\n' \
         > /etc/apt/sources.list.d/raspi.sources && \
@@ -267,7 +333,7 @@ RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root --mount=type=tmpfs,
   rm -f /etc/apt/apt.conf.d/docker-clean; \
   apt update -y && \
   apt install -y btrfs-progs bubblewrap dosfstools dracut e2fsprogs fdisk firmware-linux-free firmware-brcm80211 \
-    fuse3 libssl3 libcurl4t64 libostree-1-1 linux-image-rpi-v8 raspi-firmware netplan.io libnss-resolve libnss-myhostname \
+    fuse3 libssl3 libcurl4t64 libostree-1-1 linux-image-6.12.75+rpt-rpi-v8 raspi-firmware netplan.io libnss-resolve libnss-myhostname \
     openssh-server podman skopeo sudo systemd systemd-resolved xfsprogs && \
   cp /boot/vmlinuz-* "$(find /usr/lib/modules -maxdepth 1 -type d | tail -n 1)/vmlinuz"
 
@@ -331,14 +397,18 @@ COPY --from=bootupd /bootupd-out/usr/lib/bootupd/grub2-static /usr/lib/bootupd/g
 COPY --from=fw /grubcommon/usr/bin/grub-editenv /usr/bin/grub2-editenv
 
 RUN set -eux; \
-    # CM4 device tree(s) + the FULL DT overlay set from the RPi kernel package
-    # (linux-image-rpi-v8 ships them under /usr/lib/modules/<ver>/dtb/, NOT the
-    # Debian /usr/lib/linux-image-*/broadcom/ path) -> onto the Pi firmware set the
-    # bootupctl shim syncs to the ESP. The overlays (uart3/4/5.dtbo etc.) are what
-    # make config.txt `dtoverlay=uart3` actually enable ttyAMA3 for the app.
-    cp /usr/lib/modules/*/dtb/broadcom/bcm2711-rpi-cm4*.dtb /usr/lib/bootc-raspi-firmwares/; \
+    # CM4 device tree(s) + the FULL DT overlay set from the RPi kernel package ->
+    # onto the Pi firmware set the bootupctl shim syncs to the ESP. The overlays
+    # (uart3/4/5.dtbo etc.) are what make config.txt `dtoverlay=uart3` enable
+    # ttyAMA3. NB: the RPi packaging path MOVED between kernel series -- 6.18 ships
+    # these under /usr/lib/modules/<ver>/dtb/, 6.12 under /usr/lib/linux-image-<ver>/.
+    # So locate the broadcom dir wherever it is; overlays/ is always its sibling.
+    DTBDIR="$(dirname "$(find /usr/lib -path '*/broadcom/bcm2711-rpi-cm4-io.dtb' | head -1)")"; \
+    test -n "$DTBDIR"; \
+    OVLDIR="$(dirname "$DTBDIR")/overlays"; test -d "$OVLDIR"; \
+    cp "$DTBDIR"/bcm2711-rpi-cm4*.dtb /usr/lib/bootc-raspi-firmwares/; \
     mkdir -p /usr/lib/bootc-raspi-firmwares/overlays; \
-    cp -a /usr/lib/modules/*/dtb/overlays/. /usr/lib/bootc-raspi-firmwares/overlays/; \
+    cp -a "$OVLDIR"/. /usr/lib/bootc-raspi-firmwares/overlays/; \
     chmod +x /usr/bin/bootupctl /usr/bin/bootupctl-orig/bootupctl /usr/libexec/bootupd; \
     # Debian defaults CREATE_HOME=no; match Fedora (yes) so image-builder's users
     # stage creates /var/home/<user> (+ .ssh) at build.
