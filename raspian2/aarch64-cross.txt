@@ -1,7 +1,9 @@
 # Meson cross file: build on the native host, target aarch64 (Debian multiarch).
 [binaries]
-c = 'aarch64-linux-gnu-gcc'
-cpp = 'aarch64-linux-gnu-g++'
+# ccache prefix (meson accepts a compiler array) so recompiles reuse objects;
+# the store is a build cache mount in the Containerfile. No-op if ccache is absent.
+c = ['ccache', 'aarch64-linux-gnu-gcc']
+cpp = ['ccache', 'aarch64-linux-gnu-g++']
 ar = 'aarch64-linux-gnu-ar'
 strip = 'aarch64-linux-gnu-strip'
 pkg-config = 'pkg-config'

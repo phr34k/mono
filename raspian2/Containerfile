@@ -1,20 +1,31 @@
 # Target: Raspberry Pi Compute Module 4 (aarch64), Debian trixie base.
 #
-# Same from-source chain as raspbian/ (libcomposefs -> ostree 2025.7 -> bootc),
-# but CROSS-COMPILED: the builder stage runs on the NATIVE build host
-# (--platform=$BUILDPLATFORM) and emits aarch64 binaries via a cross toolchain,
-# so the heavy C/Rust compilation is NOT emulated. Only the final runtime stage
-# runs as the arm64 target (light apt/dracut work).
+# This ONE Containerfile builds the COMPLETE CM4 image (published as
+# raspbian3-bootc): the from-source OS chain (libcomposefs -> ostree 2025.7 ->
+# bootc) PLUS the boot stack (Pi VideoCore firmware + U-Boot, Fedora-patched GRUB
+# with blscfg, and coreos bootupd). Previously split across raspian2/Containerfile
+# + raspbian3/{Containerfile,grub-cross,bootupd-cross}; now merged into stages:
+#   builder - cross-compile composefs/ostree/bootc (native host -> aarch64)
+#   grub    - cross-build Fedora GRUB (blscfg) -> arm64-efi BOOTAA64.EFI
+#   bootupd - cross-build coreos bootupd (bootloader updater)
+#   fw      - assemble the Pi firmware set (VideoCore + U-Boot + shim)
+#   system  - the arm64 runtime image; overlays all of the above into the result
 #
-# Build with (BuildKit sets BUILDPLATFORM=host, TARGETPLATFORM=arm64):
-#   podman build --platform=linux/arm64 -f raspian2/Containerfile -t raspian2-bootc:latest .
-FROM scratch AS ctx
-
-COPY ../shared/ /shared
-# Copy only the files the builder needs (not the whole dir/Containerfile), so
-# edits to this Containerfile's runtime stage don't invalidate the cached
-# cross-compile in the builder stage.
-COPY ../raspian2/aarch64-cross.txt ../raspian2/install-bootc.sh /raspian2/
+# The heavy C/Rust compiles run NATIVELY via --platform=$BUILDPLATFORM (NOT
+# emulated); only the arm64 runtime bits (apt/dracut, firmware assembly) run as
+# the target arch.
+#
+# Build with:
+#   podman build --platform=linux/arm64 -f raspian2/Containerfile -t raspbian3-bootc:latest .
+#   (or: just build raspian2)
+# CACHING NOTE: files the build steps need are brought in with COPY, NOT with
+# `RUN --mount=type=bind,from=<stage>`. buildah (podman 4.9) does NOT layer-cache
+# a RUN that carries a bind mount -- it re-executes that step every build, which
+# cascades and forces composefs/ostree/bootc to recompile (and re-`git clone`)
+# every single time. COPY layers are content-addressed and cache cleanly. Each
+# COPY sits right before the step that consumes it, so editing one file only
+# invalidates that step and the ones after it. `--mount=type=cache` mounts, by
+# contrast, do NOT break caching, so those stay for apt/cargo/ccache speed.
 
 # ---- Cross builder: runs natively on the build host, targets aarch64 ----
 FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS builder
@@ -22,10 +33,17 @@ FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS builder
 # Enable arm64 multiarch + deb-src, then pull the aarch64 cross toolchain, the
 # native build tools, and aarch64 dev libraries (ostree's full build-dep set
 # for the arm64 host, plus composefs/bootc extras).
-RUN dpkg --add-architecture arm64 && \
+# apt cache mounts persist the cross toolchain + arm64 dev .debs across builds
+# (the Debian base's docker-clean dpkg hook purges them -> remove it, and don't
+# `rm` the lists, or the /var/lib/apt cache is defeated). ccache is pulled in so
+# the C compiles below (composefs, ostree) reuse object files on recompiles.
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    dpkg --add-architecture arm64 && \
     sed -i 's/^Types: deb$/Types: deb deb-src/' /etc/apt/sources.list.d/debian.sources && \
     apt update -y && \
-    apt install -y crossbuild-essential-arm64 git curl ca-certificates make pkgconf \
+    apt install -y ccache crossbuild-essential-arm64 git curl ca-certificates make pkgconf \
                    meson ninja-build python3 autoconf automake libtool gtk-doc-tools bison \
                    libglib2.0-dev:arm64 libgpgme-dev:arm64 libcurl4-openssl-dev:arm64 \
                    libarchive-dev:arm64 libmount-dev:arm64 libselinux1-dev:arm64 \
@@ -36,12 +54,15 @@ RUN dpkg --add-architecture arm64 && \
 ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
 ENV PKG_CONFIG_SYSROOT_DIR=/
 ENV PKG_CONFIG_ALLOW_CROSS=1
+# ccache store lives on a cache mount (see the C-compile RUNs below).
+ENV CCACHE_DIR=/root/.ccache
 
 # --- libcomposefs (cross) ---
 WORKDIR /src/composefs
-RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
+COPY ../raspian2/aarch64-cross.txt /raspian2/aarch64-cross.txt
+RUN --mount=type=cache,target=/root/.ccache \
     git clone --depth 1 -b v1.0.8 https://github.com/composefs/composefs.git . && \
-    meson setup build --cross-file /ctx/raspian2/aarch64-cross.txt \
+    meson setup build --cross-file /raspian2/aarch64-cross.txt \
           --prefix=/usr --libdir=lib/aarch64-linux-gnu -Dman=disabled && \
     meson compile -C build && \
     DESTDIR=/output meson install -C build && \
@@ -49,11 +70,16 @@ RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
 
 # --- ostree 2025.7 with composefs (cross) ---
 WORKDIR /src/ostree
-RUN git clone --depth 1 -b v2025.7 --recurse-submodules https://github.com/ostreedev/ostree.git . && \
+RUN --mount=type=cache,target=/root/.ccache \
+    git clone --depth 1 -b v2025.7 --recurse-submodules https://github.com/ostreedev/ostree.git . && \
     NOCONFIGURE=1 ./autogen.sh && \
     ./configure --host=aarch64-linux-gnu --build="$(dpkg-architecture -qDEB_BUILD_GNU_TYPE)" \
-                --prefix=/usr --libdir=/usr/lib/aarch64-linux-gnu \
+                CC="ccache aarch64-linux-gnu-gcc" \
+                --prefix=/usr --libdir=/usr/lib/aarch64-linux-gnu --sysconfdir=/etc \
                 --with-composefs --with-curl --without-soup \
+                --with-dracut \
+                --with-systemdsystemunitdir=/usr/lib/systemd/system \
+                --with-systemdsystemgeneratordir=/usr/lib/systemd/system-generators \
                 --disable-introspection --disable-gtk-doc --disable-man && \
     make -j"$(nproc)" && \
     make install DESTDIR=/output && \
@@ -63,33 +89,187 @@ RUN git clone --depth 1 -b v2025.7 --recurse-submodules https://github.com/ostre
 ENV CARGO_HOME=/tmp/rust
 ENV RUSTUP_HOME=/tmp/rust
 ENV CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+# Target dir lives OUTSIDE the clone dir (/home/build): the cache mount would
+# otherwise pre-create /home/build/target and make `git clone .` fail on a
+# non-empty dir. install-bootc.sh honors CARGO_TARGET_DIR to find the binaries.
+ENV CARGO_TARGET_DIR=/tmp/cargo-target
 ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
 ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
 ENV CXX_aarch64_unknown_linux_gnu=aarch64-linux-gnu-g++
 WORKDIR /home/build
-RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
-    git clone --depth 1 https://github.com/bootc-dev/bootc.git . && \
-    curl --proto '=https' --tlsv1.2 -sSf "https://sh.rustup.rs" | \
+# Rust toolchain in its OWN layer (installs into /tmp/rust, which persists as
+# layer content). It never changes, so it stays cached across bootc recompiles
+# instead of re-downloading ~200MB+ every time the build layer below reruns.
+RUN curl --proto '=https' --tlsv1.2 -sSf "https://sh.rustup.rs" | \
         sh -s -- --profile minimal -y --default-host "$(dpkg-architecture -qDEB_BUILD_GNU_TYPE | sed 's/-linux-/-unknown-linux-/')" && \
     . "${RUSTUP_HOME}/env" && \
-    rustup target add aarch64-unknown-linux-gnu && \
+    rustup target add aarch64-unknown-linux-gnu
+
+# Build bootc. Cargo caches: registry/git hold fetched crate sources; the target
+# dir holds compiled dependency artifacts (the big time saver). install-bootc.sh
+# reads $CARGO_TARGET_DIR in this same RUN, so the mount is live. COPY'd here (not
+# earlier) so editing install-bootc.sh doesn't invalidate composefs/ostree.
+COPY ../raspian2/install-bootc.sh /raspian2/install-bootc.sh
+RUN --mount=type=cache,target=/tmp/rust/registry,sharing=locked \
+    --mount=type=cache,target=/tmp/rust/git,sharing=locked \
+    --mount=type=cache,target=/tmp/cargo-target,sharing=locked \
+    git clone --depth 1 https://github.com/bootc-dev/bootc.git . && \
+    . "${RUSTUP_HOME}/env" && \
     cargo build --release --bins && \
-    bash /ctx/raspian2/install-bootc.sh
+    bash /raspian2/install-bootc.sh
+
+# ---- grub: cross-build Fedora's patched GRUB (blscfg) for arm64-efi ----
+# Fedora's GRUB carries the blscfg module (absent from upstream/Debian GRUB),
+# needed to boot the BLS entries ostree writes. Emits a self-contained
+# BOOTAA64.EFI at /BOOTAA64.EFI. Own stage so the slow gnulib bootstrap caches
+# independently. (type=cache mounts don't break layer caching; bind mounts do.)
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS grub
+ENV CCACHE_DIR=/root/.ccache
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    apt-get update -qq && apt-get install -y --no-install-recommends \
+        ccache crossbuild-essential-arm64 git make bison flex gettext autopoint autoconf \
+        automake libtool pkg-config python3 gawk gperf texinfo help2man ca-certificates \
+        xz-utils patch rsync
+WORKDIR /src
+RUN git clone --depth 1 -b fedora-41 https://github.com/rhboot/grub2.git .
+# Generate configure (git tree has no pre-built configure); fetches gnulib.
+RUN ./bootstrap
+# Cross-configure for arm64-efi: host tools native (BUILD_CC), modules aarch64.
+RUN ./configure \
+        --target=aarch64-linux-gnu --with-platform=efi \
+        --prefix=/usr --disable-werror \
+        BUILD_CC="ccache gcc" \
+        TARGET_CC="ccache aarch64-linux-gnu-gcc" \
+        TARGET_CXX=aarch64-linux-gnu-g++ \
+        TARGET_OBJCOPY=aarch64-linux-gnu-objcopy \
+        TARGET_STRIP=aarch64-linux-gnu-strip \
+        TARGET_NM=aarch64-linux-gnu-nm \
+        TARGET_RANLIB=aarch64-linux-gnu-ranlib
+RUN --mount=type=cache,target=/root/.ccache \
+    make -j"$(nproc)" && make install DESTDIR=/gout
+# Assemble the arm64-efi image with blscfg + modules to read ext4 /boot and run
+# the BLS entries ostree writes.
+RUN ls /gout/usr/lib/grub/arm64-efi/blscfg.mod && \
+    /gout/usr/bin/grub-mkimage \
+        -O arm64-efi \
+        -d /gout/usr/lib/grub/arm64-efi \
+        -p /EFI/BOOT \
+        -o /BOOTAA64.EFI \
+        part_gpt part_msdos ext2 fat normal configfile search search_fs_uuid \
+        search_fs_file search_label blscfg linux echo test all_video efi_gop \
+        font gfxterm terminal loadenv cat regexp gzio halt reboot && \
+    ls -l /BOOTAA64.EFI
+
+# ---- bootupd: cross-build coreos bootupd (bootloader updater) for aarch64 ----
+# Debian has no bootupd package (Fedora's bootc base ships one). Produces the
+# arm64 bootupd/bootupctl + its grub2-static config snippets under /bootupd-out.
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS bootupd
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && \
+    dpkg --add-architecture arm64 && apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        build-essential crossbuild-essential-arm64 git curl ca-certificates make pkgconf \
+        libssl-dev:arm64
+ENV CARGO_HOME=/tmp/rust RUSTUP_HOME=/tmp/rust
+ENV CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+ENV PKG_CONFIG_ALLOW_CROSS=1
+ENV PKG_CONFIG_LIBDIR=/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig
+ENV PKG_CONFIG_SYSROOT_DIR=/
+WORKDIR /src
+RUN git clone --depth 1 -b v0.2.35 https://github.com/coreos/bootupd.git .
+# Cargo caches: registry/git = crate sources, target/ = compiled artifacts. The
+# target cache is ALSO mounted on the install RUN below so it can read the binary
+# (cache mounts aren't part of the layer, so a plain next RUN wouldn't see it).
+RUN --mount=type=cache,target=/tmp/rust/registry,sharing=locked \
+    --mount=type=cache,target=/tmp/rust/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --profile minimal --default-host x86_64-unknown-linux-gnu && \
+    . "${CARGO_HOME}/env" && rustup target add aarch64-unknown-linux-gnu && \
+    cargo build --release
+# Install manually (Makefile reads target/release, but CARGO_BUILD_TARGET puts
+# the binary under target/<triple>/release). Same target cache mounted here.
+RUN --mount=type=cache,target=/src/target,sharing=locked \
+    T=target/aarch64-unknown-linux-gnu/release && \
+    install -D -m0755 "$T/bootupd" /bootupd-out/usr/libexec/bootupd && \
+    install -D -m0755 "$T/bootupd" /bootupd-out/usr/bin/bootupctl && \
+    install -m644 -D -t /bootupd-out/usr/lib/bootupd/grub2-static src/grub2/*.cfg && \
+    install -m644 -D -t /bootupd-out/usr/lib/bootupd/grub2-static/configs.d src/grub2/configs.d/*.cfg && \
+    file /bootupd-out/usr/bin/bootupctl 2>/dev/null || readelf -h "$T/bootupd" | grep Machine
+
+# ---- fw: assemble the Pi firmware set (VideoCore + U-Boot + shim) ----
+# Runs as the arm64 target: just extracts .debs, no compilation.
+FROM --platform=linux/arm64 docker.io/library/debian:trixie AS fw
+RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources && \
+    apt-get update -qq && \
+    apt-get install -y --no-install-recommends u-boot-rpi && \
+    apt-get download raspi-firmware shim-unsigned grub-common && \
+    dpkg-deb -x raspi-firmware_*.deb /rf && \
+    dpkg-deb -x shim-unsigned_*.deb /shimpkg && \
+    dpkg-deb -x grub-common_*.deb /grubcommon && \
+    rm -rf /var/lib/apt/lists/*
+COPY raspian2/config.txt /config.txt
+RUN mkdir -p /fw/overlays && \
+    cp /config.txt                             /fw/config.txt && \
+    cp /usr/lib/u-boot/rpi_arm64/u-boot.bin    /fw/u-boot.bin && \
+    cp /rf/usr/lib/raspi-firmware/start*.elf   /fw/ && \
+    cp /rf/usr/lib/raspi-firmware/fixup*.dat   /fw/ && \
+    cp /rf/usr/lib/raspi-firmware/bootcode.bin /fw/ && \
+    cp -a /rf/usr/lib/raspi-firmware/overlays/. /fw/overlays/
 
 # ---- Runtime: the aarch64 target image ----
 # Pin to the arm64 target explicitly: the builder pulled debian:trixie as the
 # native build arch, and without this podman would reuse that wrong-arch image
-# here (making apt look at the amd64 index -> no linux-image-arm64).
+# here (making apt look at the amd64 index -> no arm64 linux-image-rpi-v8).
 FROM --platform=linux/arm64 docker.io/library/debian:trixie AS system
 
 RUN sed -i 's/^Components: .*/Components: main non-free-firmware/' /etc/apt/sources.list.d/debian.sources
 
-RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root --mount=type=tmpfs,dst=/boot apt update -y && \
+# ---------------------------------------------------------------------------
+# Raspberry Pi apt repo -- ONLY for the kernel (linux-image-rpi-v8).
+#
+# Debian's linux-image-arm64 + raspi-firmware ship only 2 DT overlays (hifiberry,
+# spidev), so config.txt `dtoverlay=uart3/4/5` are silent no-ops and the CM4's
+# PL011 UARTs (ttyAMA3 = CONTROL RS-485, ttyAMA4 = 4G modem, ttyAMA5 = DMX) never
+# appear -- the EPS backend then faults in pl_uart_de and never creates its gui
+# socket. The RPi-packaged kernel ships the FULL overlay set (368 overlays) +
+# matching CM4 DTBs under /usr/lib/modules/<ver>/dtb/ -- the same source pi-gen /
+# RPi-OS / Fedora use. Verity-wise this is safe: composefs here runs enabled=yes
+# (see shared/bootc-rootfs.sh, no fs-verity requirement) and --composefs-backend
+# seals with dm-verity, which the RPi kernel has (CONFIG_DM_VERITY=m); its lack of
+# CONFIG_FS_VERITY is therefore irrelevant.
+#
+# Keyring is pi-gen's re-signed RPi archive key (the old key's SHA1 self-sig is
+# rejected by trixie's sqv). Pin the repo to 100 so it supplies ONLY packages that
+# Debian doesn't have (the RPi kernel + its RPi-only deps) and never silently
+# upgrades the Debian userland the cross-built ostree/bootc/composefs links against.
+COPY raspian2/raspberrypi-archive-keyring.pgp /usr/share/keyrings/raspberrypi-archive-keyring.pgp
+RUN printf 'Types: deb\nURIs: http://archive.raspberrypi.com/debian/\nSuites: trixie\nComponents: main\nSigned-By: /usr/share/keyrings/raspberrypi-archive-keyring.pgp\n' \
+        > /etc/apt/sources.list.d/raspi.sources && \
+    printf 'Package: *\nPin: origin archive.raspberrypi.com\nPin-Priority: 100\n' \
+        > /etc/apt/preferences.d/raspberrypi
+
+# apt cache mounts persist the downloaded .debs (/var/cache/apt) and package
+# lists (/var/lib/apt) across builds instead of baking them into the layer, so
+# re-running this (e.g. adding a package) doesn't re-download everything. The
+# Debian base's `docker-clean` purges .debs via a dpkg hook, defeating the cache
+# -> remove it. No `apt clean` needed: the debs live in the cache mount, not the
+# image. (sudo is installed HERE, not in a derived layer: bootc-rootfs.sh later
+# does `rm -rf /var`, wiping /var/lib/dpkg, so apt/dpkg can't run downstream.)
+RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root --mount=type=tmpfs,dst=/boot \
+    --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+  rm -f /etc/apt/apt.conf.d/docker-clean; \
+  apt update -y && \
   apt install -y btrfs-progs bubblewrap dosfstools dracut e2fsprogs fdisk firmware-linux-free firmware-brcm80211 \
-    fuse3 libssl3 libcurl4t64 libostree-1-1 linux-image-arm64 raspi-firmware netplan.io libnss-resolve libnss-myhostname \
-    openssh-server podman skopeo systemd systemd-resolved xfsprogs && \
-  cp /boot/vmlinuz-* "$(find /usr/lib/modules -maxdepth 1 -type d | tail -n 1)/vmlinuz" && \
-  apt clean -y
+    fuse3 libssl3 libcurl4t64 libostree-1-1 linux-image-rpi-v8 raspi-firmware netplan.io libnss-resolve libnss-myhostname \
+    openssh-server podman skopeo sudo systemd systemd-resolved xfsprogs && \
+  cp /boot/vmlinuz-* "$(find /usr/lib/modules -maxdepth 1 -type d | tail -n 1)/vmlinuz"
 
 # Overlay cross-built bootc + ostree 2025.7 + libcomposefs, refresh linker cache.
 COPY --from=builder /output /
@@ -102,20 +282,75 @@ RUN systemctl enable systemd-networkd systemd-resolved ssh && \
     printf 'network:\n  version: 2\n  ethernets:\n    all-en:\n      match:\n        name: en*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n    all-eth:\n      match:\n        name: eth*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n' > /etc/netplan/90-default.yaml && \
     sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config || true
 
+# Only the two scripts this stage runs (not all of shared/), so editing an
+# unrelated shared/*.sh doesn't invalidate these steps. Removed at the end so the
+# scripts don't linger in the committed image.
+COPY ../shared/initramfs.sh ../shared/bootc-rootfs.sh /shared/
 RUN --mount=type=tmpfs,dst=/tmp --mount=type=tmpfs,dst=/root \
-    --mount=type=bind,from=ctx,source=/,target=/ctx \
-    /ctx/shared/initramfs.sh
+    /shared/initramfs.sh
 
-RUN --mount=type=bind,from=ctx,source=/,target=/ctx \
-    sed -i 's|^HOME=.*|HOME=/var/home|' "/etc/default/useradd" && \
-    /ctx/shared/bootc-rootfs.sh
+RUN sed -i 's|^HOME=.*|HOME=/var/home|' "/etc/default/useradd" && \
+    /shared/bootc-rootfs.sh && \
+    rm -rf /shared
 
 LABEL containers.bootc 1
 
-# `bootc container lint` executes the target-arch binary. In a cross-build the
-# only way to run it on a non-arm64 host is qemu-user, which returns ENOSYS
-# (os error 38) for some syscalls bootc uses -- an emulation limitation, not an
-# image defect. Keep it non-fatal here; run `bootc container lint` for real on
-# native arm64 (hardware or an arm64 CI runner).
+# ---- Overlay the boot stack onto the runtime image (was raspbian3 stage 2) ----
+# supakeen/Budai model (https://supakeen.com/weblog/bootc-on-the-raspberry-pi/):
+# at `bootc install` the bootupctl shim copies the Pi firmware onto the ESP, then
+# execs the real bootupctl UNCHANGED. bootupd's install is additive (manages EFI/,
+# doesn't wipe the ESP root), so firmware + bootloader coexist. Boot chain:
+#   BCM2711 EEPROM -> (ESP/FAT) config.txt + start4.elf -> u-boot.bin
+#   -> U-Boot bootflow scan -> ESP/EFI/BOOT/BOOTAA64.EFI (shim) -> grubaa64.efi
+#   -> grub.cfg -> blscfg -> ostree BLS on ext4 /boot -> kernel + initramfs
+# GRUB (not systemd-boot) because /boot is ext4 (EFI firmware reads only FAT).
+
+# Pi firmware stash -> the shim copies this onto the ESP at install time.
+COPY --from=fw /fw /usr/lib/bootc-raspi-firmwares/
+
+# EFI payload in bootupd's expected layout (usr/lib/efi/<name>/<version>/EFI),
+# Fedora-style shim + GRUB so bootupd's vendordir detection (needs shimaa64.efi)
+# succeeds. Everything lives under EFI/BOOT so no persistent EFI NVRAM is needed
+# (the Pi keeps none).
+COPY --from=grub /BOOTAA64.EFI                                     /usr/lib/efi/grub2/1/EFI/BOOT/grubaa64.efi
+COPY --from=fw /shimpkg/usr/lib/shim/shimaa64.efi                  /usr/lib/efi/grub2/1/EFI/BOOT/shimaa64.efi
+COPY --from=fw /shimpkg/usr/lib/shim/shimaa64.efi                  /usr/lib/efi/grub2/1/EFI/BOOT/BOOTAA64.EFI
+COPY raspian2/grub.cfg                                            /usr/lib/efi/grub2/1/EFI/BOOT/grub.cfg
+
+# bootupctl shim (active) + the real cross-built bootupctl it execs unchanged.
+# /usr/libexec/bootupd is the same binary, used at build time for
+# generate-update-metadata.
+COPY raspian2/bootupctl-shim.sh /usr/bin/bootupctl
+COPY --from=bootupd /bootupd-out/usr/libexec/bootupd /usr/libexec/bootupd
+COPY --from=bootupd /bootupd-out/usr/bin/bootupctl   /usr/bin/bootupctl-orig/bootupctl
+# bootupd's grub2-static config snippets (stitched 10_blscfg.cfg etc.); Fedora
+# ships these in its base, we bring them from the cross-built bootupd stage.
+COPY --from=bootupd /bootupd-out/usr/lib/bootupd/grub2-static /usr/lib/bootupd/grub2-static
+# bootupd calls grub2-editenv (Fedora name); Debian ships grub-editenv in
+# grub-common. Provide the arm64 binary under the name bootupd expects.
+COPY --from=fw /grubcommon/usr/bin/grub-editenv /usr/bin/grub2-editenv
+
+RUN set -eux; \
+    # CM4 device tree(s) + the FULL DT overlay set from the RPi kernel package
+    # (linux-image-rpi-v8 ships them under /usr/lib/modules/<ver>/dtb/, NOT the
+    # Debian /usr/lib/linux-image-*/broadcom/ path) -> onto the Pi firmware set the
+    # bootupctl shim syncs to the ESP. The overlays (uart3/4/5.dtbo etc.) are what
+    # make config.txt `dtoverlay=uart3` actually enable ttyAMA3 for the app.
+    cp /usr/lib/modules/*/dtb/broadcom/bcm2711-rpi-cm4*.dtb /usr/lib/bootc-raspi-firmwares/; \
+    mkdir -p /usr/lib/bootc-raspi-firmwares/overlays; \
+    cp -a /usr/lib/modules/*/dtb/overlays/. /usr/lib/bootc-raspi-firmwares/overlays/; \
+    chmod +x /usr/bin/bootupctl /usr/bin/bootupctl-orig/bootupctl /usr/libexec/bootupd; \
+    # Debian defaults CREATE_HOME=no; match Fedora (yes) so image-builder's users
+    # stage creates /var/home/<user> (+ .ssh) at build.
+    echo 'CREATE_HOME yes' >> /etc/login.defs; \
+    # Build bootupd's update manifest (/usr/lib/bootupd/updates/EFI.json) from the
+    # staged EFI payload -- required for `backend install` and `bootupctl update`.
+    mkdir -p /usr/lib/bootupd/updates; \
+    /usr/libexec/bootupd generate-update-metadata /
+
+# `bootc container lint` on the COMPLETE image. It executes the target-arch
+# binary; under qemu-user (cross-build on a non-arm64 host) some syscalls return
+# ENOSYS (os error 38) -- an emulation limitation, not an image defect. Non-fatal
+# here; run it for real on native arm64 (hardware or an arm64 CI runner).
 RUN bootc container lint || \
     echo "WARNING: 'bootc container lint' did not run to completion (qemu-user emulation limitation); run it on native arm64"

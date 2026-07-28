@@ -22,10 +22,59 @@ build $image_name=image_name:
     # (raspian2 cross-compiles: its builder stage pins to $BUILDPLATFORM and runs
     # natively, so --platform only sets the arm64 *target*.)
     platform="${BUILD_PLATFORM:-}"
-    case "$image_name" in raspbian|raspian2|raspbian3) [ -z "$platform" ] && platform="linux/arm64" ;; esac
+    case "$image_name" in raspbian|raspian2) [ -z "$platform" ] && platform="linux/arm64" ;; esac
     args=()
     [ -n "$platform" ] && args+=(--platform "$platform")
-    {{sudo_prefix}}{{container_runtime}} build "${args[@]}" -f "$image_name/Containerfile" -t "${image_name}-bootc:latest" .
+    # raspian2/Containerfile is now the COMBINED build (former raspian2 + raspbian3
+    # + grub-cross + bootupd-cross): it produces the complete CM4 image. Tag it
+    # under its own name AND the prod name raspbian3-bootc (same image) so both the
+    # name-derived recipes (bootc/test/disk-image) and remote-build resolve it.
+    tag_args=(-t "${image_name}-bootc:latest")
+    [ "$image_name" = raspian2 ] && tag_args+=(-t "raspbian3-bootc:latest")
+    {{sudo_prefix}}{{container_runtime}} build "${args[@]}" -f "$image_name/Containerfile" "${tag_args[@]}" .
+
+remote-build-install:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    ssh -t phr34k@192.168.56.102 'echo "phr34k ALL=(ALL) NOPASSWD: /usr/bin/podman, /usr/bin/osbuild, /usr/bin/image-builder" | sudo tee /etc/sudoers.d/nexus-build && sudo chmod 440 /etc/sudoers.d/nexus-build'
+
+
+
+
+remote-pull:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    ssh phr34k@192.168.56.102 'bash -s' <<'REMOTE'
+    set -euo pipefail
+    cd ~/nexus-pi-gen
+    sudo podman pull localhost:5000/eps-prod:latest
+    sudo podman tag localhost:5000/eps-prod:latest localhost/eps-prod:latest
+    sudo podman inspect --format '{{ "{{" }}.Id}}' localhost/eps-prod:latest
+
+    REMOTE
+
+
+remote-build:
+    #!/usr/bin/env bash
+    set -euo pipefail
+
+    podman tag  localhost/raspbian3-bootc:latest 192.168.56.102:5000/eps-prod:latest 
+    podman push 192.168.56.102:5000/eps-prod:latest
+
+    ssh phr34k@192.168.56.102 'bash -s' <<'REMOTE'
+    set -euo pipefail
+    cd ~/nexus-pi-gen
+    sudo podman pull localhost:5000/eps-prod:latest
+    sudo podman tag localhost:5000/eps-prod:latest localhost/eps-prod:latest
+    sudo podman inspect --format '{{ "{{" }}.Id}}' localhost/eps-prod:latest
+
+    sudo image-builder manifest --bootc-ref localhost/eps-prod:latest --bootc-default-fs ext4 \
+        --bootc-no-default-kernel-args --blueprint blueprint.toml --arch aarch64 raw > manifest.json
+    jq '(.pipelines[]?.stages) |= map(select(.type != "org.osbuild.selinux"))' manifest.json > manifest-nosel.json
+    sudo osbuild --store ./store --output-directory ./out --export gce manifest-nosel.json
+
+    REMOTE
 
 bootc $image_name=image_name $image_tag=image_tag *ARGS:
     sudo {{container_runtime}} run \

@@ -8,7 +8,9 @@ set -xeuo pipefail
 
 D=/output
 prefix=/usr
-T=target/aarch64-unknown-linux-gnu/release
+# Honor CARGO_TARGET_DIR (the Containerfile points it outside the clone dir so a
+# target/ cache mount doesn't collide with `git clone .`); default to ./target.
+T="${CARGO_TARGET_DIR:-target}/aarch64-unknown-linux-gnu/release"
 
 # Main binaries
 install -D -m0755 -t "$D$prefix/bin" "$T/bootc"
