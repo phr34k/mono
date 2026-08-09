@@ -1,7 +1,7 @@
 mod bcvk 'bcvk.just'
 
 image_name := env("BUILD_IMAGE_NAME", "")
-image_tag := env("BUILD_IMAGE_TAG", "latest")
+image_tag := env("BUILD_IMAGE_TAG", "preview")
 base_dir := env("BUILD_BASE_DIR", ".")
 filesystem := env("BUILD_FILESYSTEM", "ext4")
 selinux := env("BUILD_SELINUX", "true")
@@ -29,8 +29,8 @@ build $image_name=image_name:
     # + grub-cross + bootupd-cross): it produces the complete CM4 image. Tag it
     # under its own name AND the prod name raspbian3-bootc (same image) so both the
     # name-derived recipes (bootc/test/disk-image) and remote-build resolve it.
-    tag_args=(-t "${image_name}-bootc:latest")
-    [ "$image_name" = raspian2 ] && tag_args+=(-t "raspbian3-bootc:latest")
+    tag_args=(-t "${image_name}-bootc:{{image_tag}}")
+    [ "$image_name" = raspian2 ] && tag_args+=(-t "raspbian3-bootc:{{image_tag}}")
     {{sudo_prefix}}{{container_runtime}} build "${args[@]}" -f "$image_name/Containerfile" "${tag_args[@]}" .
 
 remote-build-install:
