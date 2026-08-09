@@ -110,10 +110,14 @@ RUN curl --proto '=https' --tlsv1.2 -sSf "https://sh.rustup.rs" | \
 # reads $CARGO_TARGET_DIR in this same RUN, so the mount is live. COPY'd here (not
 # earlier) so editing install-bootc.sh doesn't invalidate composefs/ostree.
 COPY ../raspian2/install-bootc.sh /raspian2/install-bootc.sh
+# bootc is pinned to our fork phr34k/bootc @ feature/overlay-initrds: it adds
+# /etc/bootc/overlay-initrds.d support (ostree overlay_initrds) for runtime,
+# no-rebuild initramfs/plymouth-theme overlays. Restore bootc-dev/bootc main for
+# stock bootc. -b <branch> + --depth 1 fetches only that branch tip.
 RUN --mount=type=cache,target=/tmp/rust/registry,sharing=locked \
     --mount=type=cache,target=/tmp/rust/git,sharing=locked \
     --mount=type=cache,target=/tmp/cargo-target,sharing=locked \
-    git clone --depth 1 https://github.com/bootc-dev/bootc.git . && \
+    git clone --depth 1 -b feature/overlay-initrds https://github.com/phr34k/bootc.git . && \
     . "${RUSTUP_HOME}/env" && \
     cargo build --release --bins && \
     bash /raspian2/install-bootc.sh
