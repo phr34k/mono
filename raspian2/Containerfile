@@ -117,6 +117,7 @@ COPY ../raspian2/install-bootc.sh /raspian2/install-bootc.sh
 RUN --mount=type=cache,target=/tmp/rust/registry,sharing=locked \
     --mount=type=cache,target=/tmp/rust/git,sharing=locked \
     --mount=type=cache,target=/tmp/cargo-target,sharing=locked \
+    echo "cachebust: overlay-initrds deploy.rs checksum fix (stage_overlay_initrds)" && \
     git clone --depth 1 -b feature/overlay-initrds https://github.com/phr34k/bootc.git . && \
     . "${RUSTUP_HOME}/env" && \
     cargo build --release --bins && \
@@ -163,7 +164,7 @@ RUN ls /gout/usr/lib/grub/arm64-efi/blscfg.mod && \
         -o /BOOTAA64.EFI \
         part_gpt part_msdos ext2 fat normal configfile search search_fs_uuid \
         search_fs_file search_label blscfg linux echo test all_video efi_gop \
-        font gfxterm terminal loadenv cat regexp gzio halt reboot && \
+        font gfxterm terminal loadenv increment cat regexp gzio halt reboot && \
     ls -l /BOOTAA64.EFI
 
 # ---- bootupd: cross-build coreos bootupd (bootloader updater) for aarch64 ----
@@ -227,7 +228,7 @@ RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
         python3 python3-setuptools python3-dev swig ca-certificates \
         crossbuild-essential-arm64
 WORKDIR /src
-RUN git clone --depth 1 --branch "${UBOOT_REF}" https://source.denx.de/u-boot/u-boot.git .
+RUN git clone --depth 1 --branch "${UBOOT_REF}" https://git.u-boot-project.org/u-boot/u-boot.git .
 RUN set -eux; \
     if [ "$(dpkg --print-architecture)" = "arm64" ]; then CROSS=""; else CROSS="aarch64-linux-gnu-"; fi; \
     # Blank U-Boot's HDMI text: write only to serial so the panel stays on the
@@ -351,6 +352,37 @@ RUN systemctl enable systemd-networkd systemd-resolved ssh && \
     mkdir -p /etc/netplan && \
     printf 'network:\n  version: 2\n  ethernets:\n    all-en:\n      match:\n        name: en*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n    all-eth:\n      match:\n        name: eth*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n' > /etc/netplan/90-default.yaml && \
     sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config || true
+
+# --- Boot robustness: greenboot-style auto-rollback + watchdog ---------------
+# A freshly-staged deployment that fails to boot (or hangs) counts down in GRUB
+# (raspian2/grub.cfg) and falls back to the previous deployment instead of
+# looping or sitting on a black screen forever. Pieces:
+#   - ostree-finalize-staged arms boot_counter=3 + boot_success=0 for the next boot
+#     (grub2-editenv came from the fw stage's grub-common; grubenv is /boot/grub2/grubenv)
+#   - boot-success.service clears them once multi-user.target is reached (booted OK)
+#   - system + initramfs watchdog (bcm2835_wdt) reboots a hang so the counter advances
+#   - panic=10 + rd.shell=0/rd.emergency=reboot: a kernel panic OR an initramfs
+#     failure reboots (instead of hanging on a black screen / dropping to a rescue
+#     shell) so the counter can advance to the rollback
+RUN install -d /etc/systemd/system/ostree-finalize-staged.service.d && \
+    printf '%s\n' '[Service]' \
+      'ExecStartPost=-/usr/bin/grub2-editenv /boot/grub2/grubenv set boot_counter=3 boot_success=0' \
+      > /etc/systemd/system/ostree-finalize-staged.service.d/50-arm-bootcounter.conf && \
+    printf '%s\n' '[Unit]' 'Description=Mark boot successful (clear GRUB boot-counter)' \
+      'After=multi-user.target' '[Service]' 'Type=oneshot' \
+      'ExecStart=-/usr/bin/grub2-editenv /boot/grub2/grubenv set boot_success=1' \
+      'ExecStart=-/usr/bin/grub2-editenv /boot/grub2/grubenv unset boot_counter' \
+      '[Install]' 'WantedBy=multi-user.target' \
+      > /usr/lib/systemd/system/boot-success.service && \
+    systemctl enable boot-success.service && \
+    install -d /usr/lib/systemd/system.conf.d && \
+    printf '%s\n' '[Manager]' 'RuntimeWatchdogSec=20' 'RebootWatchdogSec=2min' \
+      > /usr/lib/systemd/system.conf.d/10-watchdog.conf && \
+    printf 'add_dracutmodules+=" watchdog watchdog-modules "\n' \
+      > /usr/lib/dracut/dracut.conf.d/30-watchdog.conf && \
+    install -d /usr/lib/bootc/kargs.d && \
+    printf '%s\n' 'kargs = ["panic=10", "rd.shell=0", "rd.emergency=reboot"]' \
+      > /usr/lib/bootc/kargs.d/00-boot-robustness.toml
 
 # Only the two scripts this stage runs (not all of shared/), so editing an
 # unrelated shared/*.sh doesn't invalidate these steps. Removed at the end so the
