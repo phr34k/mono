@@ -207,6 +207,54 @@ RUN --mount=type=cache,target=/src/target,sharing=locked \
     install -m644 -D -t /bootupd-out/usr/lib/bootupd/grub2-static/configs.d src/grub2/configs.d/*.cfg && \
     file /bootupd-out/usr/bin/bootupctl 2>/dev/null || readelf -h "$T/bootupd" | grep Machine
 
+# ---- greenboot: cross-build greenboot-rs (health-check-driven auto-rollback) ----
+# greenboot-rs is the Rust rewrite of greenboot (the old shell version is
+# deprecated). It's already bootc-native: on a health-check failure in the
+# fallback boot it runs `bootc rollback` to make the rollback STICKY -- fixing the
+# "burns MAX_BOOT_ATTEMPTS every reboot" gap of a GRUB-only counter. It shells out
+# to `grub2-editenv` against /boot/grub2/grubenv (both already provided by this
+# image) and needs NO rpm-ostree. Deps are pure-Rust (nix is syscalls only), so
+# the cross-compile needs just the aarch64 gcc linker -- no -dev libs. Pinned to a
+# tag like the other stages. Layout mirrors the bootupd stage.
+FROM --platform=$BUILDPLATFORM docker.io/library/debian:trixie AS greenboot
+RUN --mount=type=cache,target=/var/cache/apt,sharing=locked \
+    --mount=type=cache,target=/var/lib/apt,sharing=locked \
+    rm -f /etc/apt/apt.conf.d/docker-clean && apt-get update -qq && \
+    apt-get install -y --no-install-recommends \
+        build-essential crossbuild-essential-arm64 git curl ca-certificates
+ENV CARGO_HOME=/tmp/rust RUSTUP_HOME=/tmp/rust
+ENV CARGO_BUILD_TARGET=aarch64-unknown-linux-gnu
+ENV CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=aarch64-linux-gnu-gcc
+ENV CC_aarch64_unknown_linux_gnu=aarch64-linux-gnu-gcc
+WORKDIR /src
+RUN git clone --depth 1 -b v0.16.4 https://github.com/fedora-iot/greenboot-rs.git .
+RUN --mount=type=cache,target=/tmp/rust/registry,sharing=locked \
+    --mount=type=cache,target=/tmp/rust/git,sharing=locked \
+    --mount=type=cache,target=/src/target,sharing=locked \
+    curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | \
+        sh -s -- -y --profile minimal \
+        --default-host "$(dpkg-architecture -qDEB_BUILD_GNU_TYPE | sed 's/-linux-/-unknown-linux-/')" && \
+    . "${CARGO_HOME}/env" && rustup target add aarch64-unknown-linux-gnu && \
+    cargo build --release
+# Assemble the install tree. Binary -> /usr/libexec/greenboot/greenboot (the path
+# the units call). Ship ONLY the three units we want + the config: NOT the
+# 10-network-online.conf drop-in (an offline kiosk mustn't gate boot-health on
+# network-online) and NOT the Fedora default checks (they assume ostree remotes /
+# update platforms and would false-fail on Debian -> unwanted rollbacks). The
+# health-check framework with an empty required.d is trivially "healthy", so this
+# is a safe default; add real checks under /etc/greenboot/check/required.d.
+RUN --mount=type=cache,target=/src/target,sharing=locked \
+    T=target/aarch64-unknown-linux-gnu/release && \
+    install -D -m0755 "$T/greenboot" /greenboot-out/usr/libexec/greenboot/greenboot && \
+    install -D -m0644 usr/lib/systemd/system/greenboot-healthcheck.service \
+        /greenboot-out/usr/lib/systemd/system/greenboot-healthcheck.service && \
+    install -D -m0644 usr/lib/systemd/system/greenboot-set-rollback-trigger.service \
+        /greenboot-out/usr/lib/systemd/system/greenboot-set-rollback-trigger.service && \
+    install -D -m0644 usr/lib/systemd/system/greenboot-success.target \
+        /greenboot-out/usr/lib/systemd/system/greenboot-success.target && \
+    install -D -m0644 etc/greenboot/greenboot.conf /greenboot-out/etc/greenboot/greenboot.conf && \
+    readelf -h "$T/greenboot" | grep Machine
+
 # ---- uboot: rebuild U-Boot for the CM4 with no boot menu + a preboot BMP splash ----
 # Debian's stock u-boot-rpi has CONFIG_BOOTDELAY=2 and the bootstd auto-menu, so the
 # Pi shows a "Hit any key to stop autoboot" countdown + menu before GRUB, and has no
@@ -353,28 +401,39 @@ RUN systemctl enable systemd-networkd systemd-resolved ssh && \
     printf 'network:\n  version: 2\n  ethernets:\n    all-en:\n      match:\n        name: en*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n    all-eth:\n      match:\n        name: eth*\n      dhcp4: true\n      dhcp4-overrides:\n        use-domains: true\n      dhcp6: true\n      dhcp6-overrides:\n        use-domains: true\n' > /etc/netplan/90-default.yaml && \
     sed -i 's/^#PasswordAuthentication yes/PasswordAuthentication no/' /etc/ssh/sshd_config || true
 
-# --- Boot robustness: greenboot-style auto-rollback + watchdog ---------------
-# A freshly-staged deployment that fails to boot (or hangs) counts down in GRUB
-# (raspian2/grub.cfg) and falls back to the previous deployment instead of
-# looping or sitting on a black screen forever. Pieces:
-#   - ostree-finalize-staged arms boot_counter=3 + boot_success=0 for the next boot
-#     (grub2-editenv came from the fw stage's grub-common; grubenv is /boot/grub2/grubenv)
-#   - boot-success.service clears them once multi-user.target is reached (booted OK)
-#   - system + initramfs watchdog (bcm2835_wdt) reboots a hang so the counter advances
-#   - panic=10 + rd.shell=0/rd.emergency=reboot: a kernel panic OR an initramfs
-#     failure reboots (instead of hanging on a black screen / dropping to a rescue
-#     shell) so the counter can advance to the rollback
-RUN install -d /etc/systemd/system/ostree-finalize-staged.service.d && \
-    printf '%s\n' '[Service]' \
-      'ExecStartPost=-/usr/bin/grub2-editenv /boot/grub2/grubenv set boot_counter=3 boot_success=0' \
-      > /etc/systemd/system/ostree-finalize-staged.service.d/50-arm-bootcounter.conf && \
-    printf '%s\n' '[Unit]' 'Description=Mark boot successful (clear GRUB boot-counter)' \
-      'After=multi-user.target' '[Service]' 'Type=oneshot' \
-      'ExecStart=-/usr/bin/grub2-editenv /boot/grub2/grubenv set boot_success=1' \
-      'ExecStart=-/usr/bin/grub2-editenv /boot/grub2/grubenv unset boot_counter' \
-      '[Install]' 'WantedBy=multi-user.target' \
-      > /usr/lib/systemd/system/boot-success.service && \
-    systemctl enable boot-success.service && \
+# --- Boot robustness: greenboot (health-check auto-rollback) + watchdog -------
+# greenboot-rs (cross-built above) now OWNS the boot-success signal and rollback,
+# replacing the earlier DIY ostree-finalize drop-in + boot-success.service:
+#   - greenboot-set-rollback-trigger.service arms boot_counter (=GREENBOOT_MAX_BOOT
+#     _ATTEMPTS, default 3) on the FIRST boot of a freshly-staged deployment (gated
+#     by ConditionNeedsUpdate=/etc|/var, which a bootc/ostree deploy trips).
+#   - GRUB (raspian2/grub.cfg) decrements the counter each unconfirmed boot; at 0
+#     it boots the PREVIOUS deployment (default=1).
+#   - greenboot-healthcheck.service runs /etc/greenboot/check/required.d/*: all
+#     pass -> boot_success=1 + counter cleared (healthy); a required check FAILS ->
+#     success is NOT set, and once the fallback boots greenboot runs `bootc
+#     rollback` to make the rollback STICKY (no more burning 3 attempts each boot).
+#     Empty required.d = trivially healthy, so this is safe until you add checks.
+# The watchdog + panic/rd.emergency kargs are KEPT and complementary: they turn a
+# hang/panic/initramfs failure into a reboot so the counter can advance for the
+# failures that never reach greenboot at all.
+COPY --from=greenboot /greenboot-out/ /
+RUN systemctl enable greenboot-healthcheck.service && \
+    install -d /etc/greenboot/check/required.d /etc/greenboot/check/wanted.d \
+              /etc/greenboot/green.d /etc/greenboot/red.d \
+              /usr/lib/greenboot/check/required.d /usr/lib/greenboot/check/wanted.d && \
+    install -d /usr/share/greenboot/examples && \
+    printf '%s\n' '#!/bin/bash' \
+      '# Example greenboot REQUIRED health check (for the derived eps-prod kiosk).' \
+      '# Enable: copy into /etc/greenboot/check/required.d/ and `chmod +x`.' \
+      '# A non-zero exit marks the boot failed -> boot_counter is NOT cleared ->' \
+      '# after GREENBOOT_MAX_BOOT_ATTEMPTS reboots greenboot runs `bootc rollback`.' \
+      'set -euo pipefail' \
+      'systemctl is-active --quiet lightdm      || { echo "lightdm not active"; exit 1; }' \
+      'test -e /dev/fb0                          || { echo "no framebuffer";     exit 1; }' \
+      '# test -e /dev/ttyAMA4                    || { echo "4G modem uart gone";  exit 1; }' \
+      'echo "eps kiosk healthy"' \
+      > /usr/share/greenboot/examples/40_eps_kiosk.sh.example && \
     install -d /usr/lib/systemd/system.conf.d && \
     printf '%s\n' '[Manager]' 'RuntimeWatchdogSec=20' 'RebootWatchdogSec=2min' \
       > /usr/lib/systemd/system.conf.d/10-watchdog.conf && \
