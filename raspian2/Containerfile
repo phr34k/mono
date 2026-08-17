@@ -418,22 +418,17 @@ RUN systemctl enable systemd-networkd systemd-resolved ssh && \
 # hang/panic/initramfs failure into a reboot so the counter can advance for the
 # failures that never reach greenboot at all.
 COPY --from=greenboot /greenboot-out/ /
+# NB: greenboot-rs writes its boot-status line to /etc/motd.d/boot-status on EVERY
+# run; if that parent dir is missing the healthcheck dies with "Error writing motd:
+# No such file or directory" (exit 1) BEFORE it can set boot_success -- so the
+# service fails every boot even with empty (trivially-healthy) required.d. Debian
+# doesn't ship /etc/motd.d, so create it here; trixie's pam_motd reads /etc/motd.d/*
+# so this also surfaces the GREEN/RED status at login.
 RUN systemctl enable greenboot-healthcheck.service && \
-    install -d /etc/greenboot/check/required.d /etc/greenboot/check/wanted.d \
+    install -d /etc/motd.d \
+              /etc/greenboot/check/required.d /etc/greenboot/check/wanted.d \
               /etc/greenboot/green.d /etc/greenboot/red.d \
               /usr/lib/greenboot/check/required.d /usr/lib/greenboot/check/wanted.d && \
-    install -d /usr/share/greenboot/examples && \
-    printf '%s\n' '#!/bin/bash' \
-      '# Example greenboot REQUIRED health check (for the derived eps-prod kiosk).' \
-      '# Enable: copy into /etc/greenboot/check/required.d/ and `chmod +x`.' \
-      '# A non-zero exit marks the boot failed -> boot_counter is NOT cleared ->' \
-      '# after GREENBOOT_MAX_BOOT_ATTEMPTS reboots greenboot runs `bootc rollback`.' \
-      'set -euo pipefail' \
-      'systemctl is-active --quiet lightdm      || { echo "lightdm not active"; exit 1; }' \
-      'test -e /dev/fb0                          || { echo "no framebuffer";     exit 1; }' \
-      '# test -e /dev/ttyAMA4                    || { echo "4G modem uart gone";  exit 1; }' \
-      'echo "eps kiosk healthy"' \
-      > /usr/share/greenboot/examples/40_eps_kiosk.sh.example && \
     install -d /usr/lib/systemd/system.conf.d && \
     printf '%s\n' '[Manager]' 'RuntimeWatchdogSec=20' 'RebootWatchdogSec=2min' \
       > /usr/lib/systemd/system.conf.d/10-watchdog.conf && \
